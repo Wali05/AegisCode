@@ -9,8 +9,11 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "next": "16.2.3",
+    "octokit": "^5.0.5",
     "react": "19.2.4",
+    "react-diff-viewer-continued": "^4.2.0",
     "react-dom": "19.2.4"
   },
   "devDependencies": {

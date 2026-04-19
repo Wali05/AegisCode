@@ -1,26 +1,132 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+
+  --color-neon-green: #39ff14;
+  --color-neon-cyan: #00fff7;
+  --color-neon-red: #ff3b3b;
+  --color-neon-amber: #ffb800;
+  --color-surface-0: #030712;
+  --color-surface-1: #0a0f1a;
+  --color-surface-2: #111827;
+  --color-surface-3: #1f2937;
+  --color-border-dim: #1e293b;
+  --color-text-muted: #64748b;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root {
+  --background: #030712;
+  --foreground: #e2e8f0;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1e293b transparent;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/* Scanline overlay for the terminal panel */
+.scanlines {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 255, 247, 0.015) 2px,
+    rgba(0, 255, 247, 0.015) 4px
+  );
+  z-index: 1;
+}
+
+/* Pulsing glow on the submit button */
+@keyframes pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 8px rgba(57, 255, 20, 0.3),
+      0 0 20px rgba(57, 255, 20, 0.1);
+  }
+  50% {
+    box-shadow: 0 0 16px rgba(57, 255, 20, 0.5),
+      0 0 40px rgba(57, 255, 20, 0.2);
+  }
+}
+
+.btn-glow {
+  animation: pulse-glow 2.5s ease-in-out infinite;
+}
+
+.btn-glow:hover {
+  animation: none;
+  box-shadow: 0 0 24px rgba(57, 255, 20, 0.6),
+    0 0 60px rgba(57, 255, 20, 0.25);
+}
+
+/* Blinking cursor animation for terminal logs */
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.cursor-blink::after {
+  content: "█";
+  animation: blink 1s step-end infinite;
+  color: var(--color-neon-green);
+  margin-left: 2px;
+}
+
+/* Typing shimmer for log lines */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.log-line {
+  animation: fade-in-up 0.3s ease-out both;
+}
+
+/* Code block styling */
+.code-output {
+  tab-size: 2;
+  -moz-tab-size: 2;
+}
+
+.code-output::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.code-output::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.code-output::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 3px;
+}
+
+.code-output::-webkit-scrollbar-thumb:hover {
+  background: #334155;
 }
