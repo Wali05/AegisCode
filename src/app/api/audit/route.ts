@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { Octokit } from "octokit";
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 
-export const maxDuration = 60;
+export const maxDuration = 200;
 
 // --- Types ---
 
