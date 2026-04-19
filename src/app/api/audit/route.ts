@@ -374,7 +374,7 @@ async function runJudgeAgent(
           optimized_code: {
             type: SchemaType.STRING,
             description:
-              "The complete optimized version of the code incorporating all validated fixes from both agents.",
+              "The complete optimized version of the code with all validated fixes applied. Must use real newline characters (not escaped \\n), standard indentation (2 or 4 spaces), and minimal comments. No mock data or tutorial-style explanations.",
           },
         },
         required: ["verdict", "culprit", "confidence_score", "severity", "original_code", "optimized_code"],
@@ -404,6 +404,16 @@ You have access to two independent code reviews — one from the Critic and one 
 - "Medium" — Minor bugs, missing edge-case handling, suboptimal patterns
 - "High" — Memory leaks, significant algorithmic bottlenecks, resource mismanagement
 - "Critical" — Security vulnerabilities (SSRF, injection, path traversal, hardcoded secrets, broken auth)
+
+**Code Output Formatting (STRICT — optimized_code and original_code):**
+- The code MUST be formatted exactly as a developer would write it in a real file.
+- Use actual newline characters between statements. NEVER flatten code into a single long line.
+- Use standard indentation (2 spaces for JS/TS, 4 spaces for Python).
+- Do NOT add verbose explanatory comments like "// Mock Database", "// This demonstrates...", or "// Example usage".
+- Do NOT include mock implementations, placeholder data, or demonstration logic that was not in the original code.
+- Keep comments minimal — only add a brief note if a security fix is non-obvious.
+- The output must look like professional, commit-ready production code — not a tutorial or blog post.
+- One statement per line. No semicolon-separated compound statements.
 
 **Original Author**: ${author}
 
