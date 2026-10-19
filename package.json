@@ -1,29 +1,46 @@
 {
-  "name": "aegiscode-workspace",
-  "version": "0.1.0",
+  "name": "aegiscode",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint .",
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "scan": "node bin/aegis.mjs scan",
+    "check": "npm run lint && npm run typecheck && npm run test"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
+    "@google/genai": "^2.30.0",
+    "diff": "^9.0.0",
+    "lucide-react": "^1.59.0",
     "next": "16.2.3",
-    "octokit": "^5.0.5",
     "react": "19.2.4",
-    "react-diff-viewer-continued": "^4.2.0",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "sugar-high": "^2.6.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
+    "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.3",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "vitest": "^5.0.5"
+  },
+  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic → Defender → Judge LLM swarm.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.9"
+  },
+  "bin": {
+    "aegis": "bin/aegis.mjs"
   }
 }
