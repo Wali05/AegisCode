@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint · typecheck · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  self-scan:
+    name: AegisCode scans itself
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: node bin/aegis.mjs scan src --sarif aegis.sarif --md aegis.md --fail-on high
+      - run: cat aegis.md >> "$GITHUB_STEP_SUMMARY"
+        if: always()
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        # Code scanning must be enabled for the repository; don't fail the build if it isn't.
+        continue-on-error: true
+        with:
+          sarif_file: aegis.sarif
+          category: aegiscode
