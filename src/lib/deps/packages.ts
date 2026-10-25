@@ -114,17 +114,21 @@ export function extractPackageRefs(path: string, code: string, lang: Language, l
   }
 
   if (lang === "javascript" || lang === "typescript") {
-    const text = buildViews(code, lang).noComments;
+    // Match statements on the view with string contents blanked, so code quoted
+    // inside a string or template literal isn't mistaken for a real import, then
+    // read the specifier back from the same offsets in the unmasked text.
+    const { noComments, codeOnly: text } = buildViews(code, lang);
     const re = /(?:\bimport\s+(?:type\s+)?[^'"`;]*?\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s+|\bexport\s+[^'"`;]*?\bfrom\s*)(['"])([^'"\n]+)\1/g;
     for (const m of text.matchAll(re)) {
       if (/^\s*import\s+type\b/.test(m[0])) continue;
-      const name = npmPackageName(m[2]);
+      const end = m.index + m[0].length - 1;
+      const name = npmPackageName(noComments.slice(end - m[2].length, end));
       if (!name || localRoots.has(name.split("/")[0])) continue;
       const line = text.slice(0, m.index).split("\n").length;
       out.push({ name, registry: "npm", file: path, line, snippet: lines[line - 1]?.trim() ?? m[0], via: "import" });
     }
   } else if (lang === "python") {
-    const text = buildViews(code, lang).noComments;
+    const text = buildViews(code, lang).codeOnly;
     for (const m of text.matchAll(/^[ \t]*(?:from[ \t]+([A-Za-z_][\w.]*)[ \t]+import\b|import[ \t]+([A-Za-z_][\w.]*(?:[ \t]*,[ \t]*[A-Za-z_][\w.]*)*))/gm)) {
       const modules = m[1] ? [m[1]] : m[2].split(",").map((s) => s.trim().split(/\s+as\s+/)[0]);
       const line = text.slice(0, m.index).split("\n").length;

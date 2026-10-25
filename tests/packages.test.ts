@@ -24,6 +24,13 @@ describe("package references", () => {
     expect(refs.map((r) => r.name)).toEqual(["pyyaml", "scikit-learn"]);
   });
 
+  it("ignores imports quoted inside strings", () => {
+    const js = 'import real from "real-pkg";\nconst sample = `import fake from "fake-pkg";\nconst x = require("other-fake");`;\nconst s = \'import y from "quoted-pkg"\';';
+    expect(extractPackageRefs("a.ts", js, "typescript").map((r) => r.name)).toEqual(["real-pkg"]);
+    const py = 'import yaml\nDOC = """\nimport requestz\n"""\n';
+    expect(extractPackageRefs("a.py", py, "python").map((r) => r.name)).toEqual(["pyyaml"]);
+  });
+
   it("reads manifests", () => {
     const refs = extractPackageRefs("package.json", JSON.stringify({ dependencies: { "left-pad": "^1.3.0" } }, null, 2), "json");
     expect(refs).toEqual([expect.objectContaining({ name: "left-pad", via: "manifest", line: 3 })]);
