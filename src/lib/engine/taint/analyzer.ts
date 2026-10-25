@@ -88,7 +88,10 @@ export type ImportMap = Map<string, ImportBinding>;
 
 /** Names validated by a condition, and on which branch (true / false) they are known to be safe. */
 interface Guard {
+  /** Local variables proven safe. */
   names: string[];
+  /** Non-local expressions proven safe, as normalised source text (e.g. `req.query.next`). */
+  texts: string[];
   whenTrue: boolean;
 }
 
@@ -97,7 +100,15 @@ const HTML_TAG = /<\/?[a-z][\w-]*[\s>]/i;
 
 class Scope {
   private vars = new Map<string, Taint | null>();
+  private clean = new Set<string>();
   constructor(readonly parent?: Scope) {}
+  /** Marks an expression (by normalised text) as validated within this scope. */
+  markClean(text: string) {
+    this.clean.add(text);
+  }
+  isClean(text: string): boolean {
+    return this.clean.has(text) || !!this.parent?.isClean(text);
+  }
   declare(name: string, taint: Taint | null) {
     this.vars.set(name, taint);
   }
@@ -444,45 +455,67 @@ export class TaintAnalyzer {
    */
   private visitIf(node: ts.IfStatement, scope: Scope) {
     this.evalExpr(node.expression, scope);
-    const guard = this.guardOf(node.expression);
+    const guard = this.guardOf(node.expression, scope);
 
-    const thenScope = new Scope(scope);
-    if (guard?.whenTrue) for (const n of guard.names) thenScope.declare(n, null);
-    this.visit(node.thenStatement, thenScope);
-
-    if (node.elseStatement) {
-      const elseScope = new Scope(scope);
-      if (guard && !guard.whenTrue) for (const n of guard.names) elseScope.declare(n, null);
-      this.visit(node.elseStatement, elseScope);
-    }
+    this.visit(node.thenStatement, this.guardedScope(scope, guard, true));
+    if (node.elseStatement) this.visit(node.elseStatement, this.guardedScope(scope, guard, false));
 
     if (!guard) return;
     const exitBranch = guard.whenTrue ? node.elseStatement : node.thenStatement;
-    if (exitBranch && exits(exitBranch)) for (const n of guard.names) if (scope.has(n)) scope.assign(n, null);
+    if (exitBranch && exits(exitBranch)) {
+      for (const n of guard.names) if (scope.has(n)) scope.assign(n, null);
+      for (const t of guard.texts) scope.markClean(t);
+    }
   }
 
-  private guardOf(cond: ts.Expression): Guard | null {
+  /** A child scope in which the guard's subjects are clean, for the branch where `cond === branch`. */
+  private guardedScope(scope: Scope, guard: Guard | null, branch: boolean): Scope {
+    const inner = new Scope(scope);
+    if (guard && guard.whenTrue === branch) {
+      for (const n of guard.names) inner.declare(n, null);
+      for (const t of guard.texts) inner.markClean(t);
+    }
+    return inner;
+  }
+
+  /** What a validated expression proves safe: a local variable, or (for request fields etc.) the expression itself. */
+  private subjectsOf(expr: ts.Expression, scope: Scope): Pick<Guard, "names" | "texts"> {
+    let e = expr;
+    for (;;) {
+      if (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+      else if (ts.isCallExpression(e) && ts.isIdentifier(e.expression) && e.expression.text === "String" && e.arguments.length === 1) e = e.arguments[0];
+      else break;
+    }
+    if (ts.isIdentifier(e)) return { names: [e.text], texts: [] };
+    // A validated request field (req.query.next) clears that field only, never the whole request object.
+    const base = baseName(e);
+    if (base && scope.has(base) && !this.sourceFromMember(e)) return { names: [base], texts: [] };
+    return { names: [], texts: [this.calleeText(e)] };
+  }
+
+  private guardOf(cond: ts.Expression, scope: Scope): Guard | null {
     while (ts.isParenthesizedExpression(cond)) cond = cond.expression;
 
     if (ts.isPrefixUnaryExpression(cond) && cond.operator === ts.SyntaxKind.ExclamationToken) {
-      const inner = this.guardOf(cond.operand);
-      return inner ? { names: inner.names, whenTrue: !inner.whenTrue } : null;
+      const inner = this.guardOf(cond.operand, scope);
+      return inner ? { ...inner, whenTrue: !inner.whenTrue } : null;
     }
 
     if (ts.isBinaryExpression(cond)) {
       const op = cond.operatorToken.kind;
       if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken) {
-        const parts = [this.guardOf(cond.left), this.guardOf(cond.right)];
+        const parts = [this.guardOf(cond.left, scope), this.guardOf(cond.right, scope)];
         const isAnd = op === ts.SyntaxKind.AmpersandAmpersandToken;
         // `A && B` true ⇒ both hold, so any side that is safe-when-true counts (union).
-        // `A && B` false ⇒ only "at least one fails", so a name is safe only if every side guards it (intersection).
+        // `A && B` false ⇒ only "at least one fails", so a subject is safe only if every side guards it (intersection).
         // `||` is the mirror image.
-        const union = parts.filter((g): g is Guard => !!g && g.whenTrue === isAnd).flatMap((g) => g.names);
-        if (union.length) return { names: [...new Set(union)], whenTrue: isAnd };
+        const agreeing = parts.filter((g): g is Guard => !!g && g.whenTrue === isAnd);
+        if (agreeing.length) return { names: [...new Set(agreeing.flatMap((g) => g.names))], texts: [...new Set(agreeing.flatMap((g) => g.texts))], whenTrue: isAnd };
         if (parts.every((g) => g && g.whenTrue === !isAnd)) {
           const [l, r] = parts as Guard[];
-          const both = l.names.filter((n) => r.names.includes(n));
-          if (both.length) return { names: both, whenTrue: !isAnd };
+          const names = l.names.filter((n) => r.names.includes(n));
+          const texts = l.texts.filter((t) => r.texts.includes(t));
+          if (names.length || texts.length) return { names, texts, whenTrue: !isAnd };
         }
         return null;
       }
@@ -500,23 +533,24 @@ export class TaintAnalyzer {
           if (!/^(?:number|boolean|bigint)$/.test(t.text)) return null;
           subject = subject.expression;
         }
-        const name = baseName(subject);
-        return name ? { names: [name], whenTrue: eq } : null;
+        return { ...this.subjectsOf(subject, scope), whenTrue: eq };
       }
       return null;
     }
 
     if (ts.isCallExpression(cond)) {
-      const names = this.validatedBy(cond);
-      return names.length ? { names, whenTrue: true } : null;
+      const subjects = this.validatedBy(cond);
+      if (!subjects.length) return null;
+      const all = subjects.map((e) => this.subjectsOf(e, scope));
+      return { names: all.flatMap((x) => x.names), texts: all.flatMap((x) => x.texts), whenTrue: true };
     }
     return null;
   }
 
-  /** Names that a validating call proves safe when it returns true. */
-  private validatedBy(call: ts.CallExpression): string[] {
+  /** Expressions that a validating call proves safe when it returns true. */
+  private validatedBy(call: ts.CallExpression): ts.Expression[] {
     const callee = this.calleeText(call.expression);
-    const argNames = () => call.arguments.map(baseName).filter((n): n is string => !!n);
+    const argNames = () => [...call.arguments];
 
     if (ts.isPropertyAccessExpression(call.expression)) {
       const method = call.expression.name.text;
@@ -532,8 +566,7 @@ export class TaintAnalyzer {
       if (method === "startsWith" && call.arguments[0]) {
         const arg = call.arguments[0];
         if (ts.isStringLiteralLike(arg) && /^[a-z][\w+.-]*:(?:\/\/)?$/i.test(arg.text)) return [];
-        const n = baseName(receiver);
-        return n ? [n] : [];
+        return [receiver];
       }
     }
     // isUuid(x), isValidId(x), validator.isEmail(x), Number.isInteger(x), validateSlug(x)
@@ -663,6 +696,7 @@ export class TaintAnalyzer {
 
   private evalExpr(node: ts.Expression, scope: Scope): Taint | null {
     if (ts.isIdentifier(node)) return scope.lookup(node.text);
+    if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isCallExpression(node)) && scope.isClean(this.calleeText(node))) return null;
 
     if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node) || ts.isAwaitExpression(node)) {
       return this.evalExpr(node.expression, scope);
@@ -704,7 +738,9 @@ export class TaintAnalyzer {
 
     if (ts.isConditionalExpression(node)) {
       this.evalExpr(node.condition, scope);
-      return this.union(this.evalExpr(node.whenTrue, scope), this.evalExpr(node.whenFalse, scope));
+      // isSafe(x) ? x : fallback — each branch is evaluated knowing which way the check went.
+      const guard = this.guardOf(node.condition, scope);
+      return this.union(this.evalExpr(node.whenTrue, this.guardedScope(scope, guard, true)), this.evalExpr(node.whenFalse, this.guardedScope(scope, guard, false)));
     }
 
     if (ts.isObjectLiteralExpression(node)) {
