@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "diff": "^9.0.0",
     "lucide-react": "^1.59.0",
     "next": "16.2.3",
@@ -36,7 +37,7 @@
     "tailwindcss": "^4",
     "vitest": "^5.0.5"
   },
-  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic \u2192 Defender \u2192 Judge LLM swarm.",
+  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic → Defender → Judge LLM swarm.",
   "license": "MIT",
   "engines": {
     "node": ">=20.9"

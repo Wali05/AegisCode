@@ -228,6 +228,8 @@ export interface PackageCheck {
   checked: number;
   skippedPopular: number;
   unreachable: number;
+  /** Names that could not be looked up (registry unreachable) — never report these as safe. */
+  unchecked: string[];
   findings: Finding[];
 }
 
@@ -237,7 +239,7 @@ export async function checkPackages(refs: PackageRef[], opts: { signal?: AbortSi
   const unique = [...new Map(refs.map((r) => [`${r.registry}:${r.name}`, r])).values()];
   const toCheck = unique.filter((r) => !POPULAR[r.registry].has(r.name)).slice(0, opts.limit ?? 80);
   const findings: Finding[] = [];
-  let unreachable = 0;
+  const unchecked: string[] = [];
 
   const emit = (rule: RuleMeta, ref: PackageRef, confidence: number, extra: { title?: string; description?: string; severity?: Finding["severity"] } = {}) => {
     findings.push(
@@ -259,7 +261,7 @@ export async function checkPackages(refs: PackageRef[], opts: { signal?: AbortSi
     try {
       info = await lookup(ref.name, ref.registry, opts.signal);
     } catch {
-      unreachable++;
+      unchecked.push(ref.name);
       if (similar) emit(PACKAGE_RULES.lookalike, ref, 0.6, { title: `\`${ref.name}\` looks like \`${similar}\`` });
       return;
     }
@@ -293,5 +295,5 @@ export async function checkPackages(refs: PackageRef[], opts: { signal?: AbortSi
     if (info.deprecated) emit(PACKAGE_RULES.deprecated, ref, 0.9, { title: `\`${ref.name}\` is deprecated`, description: `${PACKAGE_RULES.deprecated.description} Note from the maintainers: "${info.deprecated.slice(0, 160)}"` });
   });
 
-  return { checked: toCheck.length, skippedPopular: unique.length - toCheck.length, unreachable, findings };
+  return { checked: toCheck.length - unchecked.length, skippedPopular: unique.length - toCheck.length, unreachable: unchecked.length, unchecked, findings };
 }

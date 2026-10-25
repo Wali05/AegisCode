@@ -62,7 +62,7 @@ describe("registry check", () => {
     );
     const refs = ["ghost-pkg", "fresh-pkg", "lodahs", "old-pkg", "react"].map((name, i) => ({ name, registry: "npm" as const, file: "a.ts", line: i + 1, snippet: `import x from "${name}"`, via: "import" as const }));
     const res = await checkPackages(refs, { now: NOW });
-    expect(res).toMatchObject({ checked: 4, skippedPopular: 1, unreachable: 0 });
+    expect(res).toMatchObject({ checked: 4, skippedPopular: 1, unreachable: 0, unchecked: [] });
     const byRule = (id: string) => res.findings.filter((f) => f.ruleId === id).map((f) => f.snippet.match(/"(.+)"/)![1]);
     expect(byRule("AEG-PKG-001")).toEqual(["ghost-pkg"]);
     expect(byRule("AEG-PKG-002")).toEqual(["lodahs"]);
@@ -76,6 +76,7 @@ describe("registry check", () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
     const res = await checkPackages([{ name: "expresss", registry: "npm", file: "a.ts", line: 1, snippet: "x", via: "import" }]);
     expect(res.unreachable).toBe(1);
+    expect(res.unchecked).toEqual(["expresss"]);
     expect(res.findings.map((f) => f.ruleId)).toEqual(["AEG-PKG-002"]);
   });
 });
