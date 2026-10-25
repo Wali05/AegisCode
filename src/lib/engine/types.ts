@@ -37,7 +37,7 @@ export type FindingCategory =
   | "dependency";
 
 /** Which part of the pipeline produced a finding. */
-export type Detector = "taint" | "pattern" | "secret" | "metric" | "swarm" | "osv";
+export type Detector = "taint" | "pattern" | "secret" | "metric" | "swarm" | "osv" | "supply";
 
 export type FindingStatus = "open" | "confirmed" | "disputed" | "dismissed";
 

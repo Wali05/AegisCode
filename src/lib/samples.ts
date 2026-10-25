@@ -210,6 +210,31 @@ func Fingerprint(data []byte) string {
 `,
   },
   {
+    id: "agent",
+    label: "AI agent output",
+    filename: "scripts/sync-invoices.ts",
+    blurb: "Code a coding agent wrote: two imported packages don't exist, one is a lookalike, and the PDF path comes straight from the request.",
+    code: `import express from "express";
+import { parsePdfInvoice } from "pdf-invoice-parser-pro";
+import { retryWithBackoff } from "async-retry-helper-ts";
+import lodahs from "lodahs";
+import fs from "node:fs/promises";
+import path from "node:path";
+
+const app = express();
+app.use(express.json());
+
+app.post("/invoices/import", async (req, res) => {
+  const file = path.join("/srv/invoices", req.body.fileName);
+  const pdf = await fs.readFile(file);
+  const invoice = await retryWithBackoff(() => parsePdfInvoice(pdf));
+  res.json(lodahs.pick(invoice, ["number", "total", "dueDate"]));
+});
+
+app.listen(3000);
+`,
+  },
+  {
     id: "clean",
     label: "Clean utility",
     filename: "src/lib/format.ts",

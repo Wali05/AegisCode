@@ -113,7 +113,7 @@ describe("pipeline", () => {
     expect(report.summary.grade).toBe("F");
     expect(report.swarm).toMatchObject({ status: "skipped", reason: expect.stringContaining("GEMINI_API_KEY") });
     const stageIds = events.filter((e) => e.type === "stage").map((e) => (e as Extract<PipelineEvent, { type: "stage" }>).stage.id);
-    expect(new Set(stageIds)).toEqual(new Set(["ingest", "parse", "taint", "patterns", "secrets", "metrics", "deps", "triage", "critic", "defender", "judge", "verify"]));
+    expect(new Set(stageIds)).toEqual(new Set(["ingest", "parse", "taint", "patterns", "secrets", "metrics", "deps", "packages", "triage", "critic", "defender", "judge", "verify"]));
     expect(report.sources[SAMPLES[0].filename]).toBe(SAMPLES[0].code);
   });
 

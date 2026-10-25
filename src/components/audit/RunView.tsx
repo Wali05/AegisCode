@@ -11,7 +11,7 @@ import { Button, SectionLabel, cn } from "../ui";
 const GROUPS: Array<{ label: string; stages: StageId[] }> = [
   { label: "Ingest", stages: ["ingest"] },
   { label: "Static engine", stages: ["parse", "taint", "patterns", "secrets", "metrics"] },
-  { label: "Supply chain", stages: ["deps"] },
+  { label: "Supply chain", stages: ["deps", "packages"] },
   { label: "Gate", stages: ["triage"] },
   { label: "Adversarial swarm", stages: ["critic", "defender", "judge", "verify"] },
 ];

@@ -3,6 +3,7 @@ import { PATTERN_RULES } from "./engine/rules/patterns";
 import { SECRET_RULES } from "./engine/secrets";
 import { SINKS } from "./engine/taint/model";
 import { QUALITY_RULES } from "./engine/quality";
+import { PACKAGE_RULE_LIST } from "./deps/packages";
 
 export interface CatalogRule {
   id: string;
@@ -41,6 +42,7 @@ export function ruleCatalog(): CatalogRule[] {
     ...sinks.values(),
     ...PATTERN_RULES.map(strip),
     ...SECRET_RULES.map(strip),
+    ...PACKAGE_RULE_LIST.map((r) => strip(r as CatalogRule)),
     ...Object.values(QUALITY_RULES).map((q) => strip({ ...q, languages: ["javascript", "typescript"], detector: "metric" })),
   ];
 }

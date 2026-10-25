@@ -90,6 +90,7 @@ const STAGE_LABEL: Record<string, string> = {
   secrets: "Secret scan",
   metrics: "Metrics",
   deps: "Dependencies (OSV)",
+  packages: "Package check",
   triage: "Risk triage",
   critic: "Critic",
   defender: "Defender",

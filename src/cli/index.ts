@@ -9,6 +9,8 @@ import type { FileReport } from "../lib/engine/types";
 import { selectFiles, type TreeEntry } from "../lib/github";
 import { isManifest, parseManifest } from "../lib/deps/manifests";
 import { scanDependencies } from "../lib/deps/osv";
+import { checkPackages, extractPackageRefs } from "../lib/deps/packages";
+import { detectLanguage } from "../lib/engine/language";
 import { toMarkdown, toSarif } from "../lib/report/export";
 import { ENGINE_VERSION, RULE_COUNT } from "../lib/pipeline";
 
@@ -23,7 +25,7 @@ Options
   --md <file>         write a Markdown report
   --fail-on <sev>     exit 1 if an open finding is at or above: critical | high | medium | low
   --max-files <n>     audit at most n files, ranked by attack surface (default 1000)
-  --no-deps           skip OSV.dev dependency advisories
+  --no-deps           skip network checks (OSV advisories and the npm / PyPI package check)
   --quiet             only print the summary line
 `;
 
@@ -104,7 +106,8 @@ export async function main(argv: string[]): Promise<number> {
     const base = isFile ? resolve(root, "..") : root;
     const entries = walk(root);
     const { sources, manifests } = selectFiles(entries, args.maxFiles);
-    for (const report of scanProject(sources.map((e) => ({ path: e.path, code: readFileSync(join(base, e.path), "utf8") })))) {
+    const sourceFiles = sources.map((e) => ({ path: e.path, code: readFileSync(join(base, e.path), "utf8") }));
+    for (const report of scanProject(sourceFiles)) {
       files++;
       loc += report.metrics.loc;
       findings.push(...report.findings);
@@ -120,6 +123,17 @@ export async function main(argv: string[]): Promise<number> {
         if (!args.quiet) console.log(c.dim(`osv: ${res.vulnerable}/${res.scanned} packages with advisories`));
       } catch (err) {
         console.error(c.yellow(`osv: skipped (${err instanceof Error ? err.message : "unreachable"})`));
+      }
+    }
+    if (args.deps) {
+      const all = [...sourceFiles, ...manifestPaths.map((m) => ({ path: m, code: readFileSync(join(base, m), "utf8") }))];
+      const roots = new Set(entries.flatMap((e) => [e.path.split("/")[0], e.path.split("/").pop()!.replace(/\.\w+$/, "")]));
+      const refs = all.flatMap((f) => extractPackageRefs(f.path, f.code, detectLanguage(f.path, f.code), roots));
+      if (refs.length) {
+        const res = await checkPackages(refs);
+        findings.push(...res.findings);
+        depFindings.push(...res.findings);
+        if (!args.quiet) console.log(c.dim(`packages: ${res.checked} checked against npm / PyPI · ${res.findings.length} flagged${res.unreachable ? ` · ${res.unreachable} unreachable` : ""}`));
       }
     }
   }
@@ -159,6 +173,7 @@ export async function main(argv: string[]): Promise<number> {
         files: [],
         sources: {},
         dependencies: null,
+        packages: null,
         swarm: { status: "skipped", reason: "CLI runs the deterministic engine only." },
         stages: [],
         engine: report.engine,

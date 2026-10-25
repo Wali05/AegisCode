@@ -39,13 +39,60 @@ export function SourcePanel({ report, file, line, onFile, onSelectLine }: { repo
 // ─── Dependencies ────────────────────────────────────────────────────────────
 
 export function DependenciesPanel({ report }: { report: AuditReport }) {
-  const deps = report.findings.filter((f) => f.detector === "osv");
-  const info = report.dependencies;
-  if (!info) return null;
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      {report.packages && <PackageSection report={report} />}
+      {report.dependencies && <AdvisorySection report={report} />}
+    </div>
+  );
+}
+
+function PackageSection({ report }: { report: AuditReport }) {
+  const info = report.packages!;
+  const flagged = report.findings.filter((f) => f.detector === "supply");
+  return (
+    <section className="space-y-3">
       <div className="panel flex flex-wrap items-center gap-6 p-5 text-[13px]">
-        <Stat label="Packages checked" value={info.scanned} />
+        <Stat label="Packages imported" value={info.checked + info.skippedPopular} />
+        <Stat label="Checked on registry" value={info.checked} />
+        <Stat label="Flagged" value={info.flagged} />
+        <p className="min-w-0 flex-1 text-fg-3">
+          Every import and manifest entry is checked against npm / PyPI for names that don&apos;t exist (often invented by AI assistants), lookalikes of popular packages, very recent first releases and
+          install-time scripts. Well-known packages are skipped.
+          {info.unreachable > 0 && <span className="mt-1 block text-sev-medium">{info.unreachable} package{info.unreachable === 1 ? "" : "s"} could not be checked (registry unreachable).</span>}
+        </p>
+      </div>
+      {flagged.length > 0 ? (
+        <ul className="panel divide-y divide-line">
+          {flagged.map((f) => (
+            <li key={f.id} className="flex flex-wrap items-start gap-3 px-4 py-3">
+              <SeverityBadge severity={f.severity} />
+              <div className="min-w-0 flex-1">
+                <div className="text-[13.5px] text-fg">{f.title.replace(/`/g, "")}</div>
+                <div className="mt-0.5 font-mono text-[11.5px] text-fg-3">
+                  {f.file}:{f.location.line} · {f.ruleId}
+                </div>
+                <p className="mt-1.5 text-[12.5px] leading-relaxed text-fg-2">{f.remediation}</p>
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="flex items-center gap-2 text-[13px] text-fg-2">
+          <ShieldCheck className="size-4 text-accent" /> Every imported package exists and nothing looked suspicious.
+        </p>
+      )}
+    </section>
+  );
+}
+
+function AdvisorySection({ report }: { report: AuditReport }) {
+  const deps = report.findings.filter((f) => f.detector === "osv");
+  const info = report.dependencies!;
+  return (
+    <section className="space-y-3">
+      <div className="panel flex flex-wrap items-center gap-6 p-5 text-[13px]">
+        <Stat label="Pinned versions checked" value={info.scanned} />
         <Stat label="Vulnerable" value={info.vulnerable} />
         <Stat label="Advisories" value={deps.length} />
         <div className="min-w-0 flex-1 text-fg-3">
@@ -90,7 +137,7 @@ export function DependenciesPanel({ report }: { report: AuditReport }) {
           </p>
         )
       )}
-    </div>
+    </section>
   );
 }
 

@@ -9,6 +9,8 @@ import { SINKS } from "./engine/taint/model";
 import { QUALITY_RULES } from "./engine/quality";
 import { isManifest, parseManifest } from "./deps/manifests";
 import { scanDependencies } from "./deps/osv";
+import { checkPackages, extractPackageRefs, PACKAGE_RULE_LIST } from "./deps/packages";
+import { detectLanguage } from "./engine/language";
 import { GitHubClient, GitHubError, parseGitHubUrl, selectFiles } from "./github";
 import type { LlmProvider } from "./swarm/provider";
 import { runSwarm } from "./swarm/run";
@@ -16,7 +18,7 @@ import { mapLimit } from "./util/concurrency";
 import type { AuditReport, AuditTarget, PipelineEvent, StageId, StageRecord, StageStatus, SwarmResult, SwarmSkipped } from "./report/types";
 
 export const ENGINE_VERSION = "2.0.0";
-export const RULE_COUNT = PATTERN_RULES.length + SECRET_RULES.length + new Set(SINKS.map((s) => s.id)).size + Object.keys(QUALITY_RULES).length;
+export const RULE_COUNT = PATTERN_RULES.length + SECRET_RULES.length + new Set(SINKS.map((s) => s.id)).size + Object.keys(QUALITY_RULES).length + PACKAGE_RULE_LIST.length;
 
 export type SwarmMode = "auto" | "force" | "off";
 
@@ -150,6 +152,25 @@ export async function runAudit(input: AuditInput, deps: PipelineDeps, emit: (e: 
     stage("deps", "skipped", "no manifests");
   }
 
+  // ── Package check ─────────────────────────────────────────────────────────
+  let packages: AuditReport["packages"] = null;
+  const localRoots = new Set([...files, ...manifests].flatMap((f) => [f.path.split("/")[0], f.path.split("/").pop()!.replace(/\.\w+$/, "")]));
+  const refs = [...files, ...manifests].flatMap((f) => extractPackageRefs(f.path, f.content, detectLanguage(f.path, f.content), localRoots));
+  if (refs.length) {
+    stage("packages", "running");
+    const t0 = Date.now();
+    const res = await checkPackages(refs, { signal: deps.signal });
+    depFindings = [...depFindings, ...res.findings];
+    packages = { checked: res.checked, flagged: new Set(res.findings.map((f) => f.snippet)).size, skippedPopular: res.skippedPopular, unreachable: res.unreachable };
+    const detail = res.unreachable === res.checked && res.checked > 0 ? "registries unreachable" : `${res.checked + res.skippedPopular} packages · ${res.findings.length} flagged`;
+    stage("packages", res.unreachable === res.checked && res.checked > 0 ? "error" : "done", detail, Date.now() - t0);
+    const missing = res.findings.filter((f) => f.ruleId === "AEG-PKG-001").length;
+    if (missing) log("warn", "packages", `${missing} imported package${missing === 1 ? " does" : "s do"} not exist on the registry — likely invented by an AI assistant.`);
+    else log("success", "packages", `Checked ${res.checked} package${res.checked === 1 ? "" : "s"} against npm / PyPI (${res.skippedPopular} well-known ones skipped).`);
+  } else {
+    stage("packages", "skipped", "no third-party imports");
+  }
+
   // ── Triage + swarm ────────────────────────────────────────────────────────
   stage("triage", "running");
   const candidate = [...reports].sort((a, b) => b.triage.risk - a.triage.risk)[0];
@@ -233,6 +254,7 @@ export async function runAudit(input: AuditInput, deps: PipelineDeps, emit: (e: 
     files: reports,
     sources,
     dependencies,
+    packages,
     swarm: swarm!,
     stages: [...stages.values()],
     engine: { version: ENGINE_VERSION, rules: RULE_COUNT },

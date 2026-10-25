@@ -73,7 +73,7 @@ export function compareFindings(a: Finding, b: Finding): number {
  * that flagged the same sink.
  */
 export function dedupeFindings(findings: Finding[]): Finding[] {
-  const priority: Record<Detector, number> = { taint: 5, swarm: 4, secret: 3, osv: 3, pattern: 2, metric: 1 };
+  const priority: Record<Detector, number> = { taint: 5, swarm: 4, secret: 3, osv: 3, supply: 3, pattern: 2, metric: 1 };
   const byKey = new Map<string, Finding>();
   for (const f of findings) {
     // Quality findings are distinct per rule; security findings collapse per weakness class.

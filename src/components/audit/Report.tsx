@@ -42,7 +42,7 @@ export function Report({ report, onReset }: { report: AuditReport; onReset: () =
       { id: "source" as const, label: "Source", icon: <Code2 className="size-3.5" />, hidden: !Object.keys(report.sources).length },
       { id: "debate" as const, label: "Debate", count: swarm?.claims.length, icon: <Scale className="size-3.5" />, hidden: !swarm },
       { id: "patch" as const, label: "Patch", icon: <Wand2 className="size-3.5" />, hidden: !swarm?.patch },
-      { id: "deps" as const, label: "Dependencies", count: report.findings.filter((f) => f.detector === "osv").length, icon: <Package className="size-3.5" />, hidden: !report.dependencies },
+      { id: "deps" as const, label: "Supply chain", count: report.findings.filter((f) => f.detector === "osv" || f.detector === "supply").length, icon: <Package className="size-3.5" />, hidden: !report.dependencies && !report.packages },
       { id: "files" as const, label: "Files", count: report.files.length, icon: <FileStack className="size-3.5" />, hidden: report.files.length < 2 },
       { id: "metrics" as const, label: "Metrics", icon: <Gauge className="size-3.5" /> },
       { id: "pipeline" as const, label: "Pipeline", icon: <Timer className="size-3.5" /> },

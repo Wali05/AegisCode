@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowDown, Bot, Check, ExternalLink, Fingerprint, GitBranch, KeyRound, Package, Ruler, Search, ShieldCheck, Workflow, X } from "lucide-react";
+import { ArrowDown, Bot, Check, ExternalLink, Fingerprint, GitBranch, KeyRound, Package, PackageSearch, Ruler, Search, ShieldCheck, Workflow, X } from "lucide-react";
 import type { Detector, Finding, Severity } from "@/lib/engine/types";
 import { SEVERITIES } from "@/lib/engine/types";
 import { CodeView } from "./CodeView";
@@ -14,6 +14,7 @@ export const DETECTOR_META: Record<Detector, { label: string; Icon: typeof Bot }
   metric: { label: "Quality", Icon: Ruler },
   swarm: { label: "AI swarm", Icon: Bot },
   osv: { label: "Dependency", Icon: Package },
+  supply: { label: "Package check", Icon: PackageSearch },
 };
 
 const cweUrl = (c: string) => `https://cwe.mitre.org/data/definitions/${c.replace("CWE-", "")}.html`;

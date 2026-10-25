@@ -4,7 +4,7 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import { streamAudit, type AuditRequest } from "@/lib/client/stream";
 import type { AuditReport, DebateClaim, PipelineEvent, StageId, StageRecord } from "@/lib/report/types";
 
-export const STAGE_ORDER: StageId[] = ["ingest", "parse", "taint", "patterns", "secrets", "metrics", "deps", "triage", "critic", "defender", "judge", "verify"];
+export const STAGE_ORDER: StageId[] = ["ingest", "parse", "taint", "patterns", "secrets", "metrics", "deps", "packages", "triage", "critic", "defender", "judge", "verify"];
 
 export type LogLine = Extract<PipelineEvent, { type: "log" }> & { id: number };
 

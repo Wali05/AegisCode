@@ -9,6 +9,7 @@ export type StageId =
   | "secrets"
   | "metrics"
   | "deps"
+  | "packages"
   | "triage"
   | "critic"
   | "defender"
@@ -110,6 +111,8 @@ export interface AuditReport {
   /** File contents for the source viewer (all of them for single files; only files with findings for repos). */
   sources: Record<string, string>;
   dependencies: { scanned: number; vulnerable: number; manifests: string[]; error?: string } | null;
+  /** Registry check of every imported / declared package (hallucinated, lookalike, brand-new…). */
+  packages: { checked: number; flagged: number; skippedPopular: number; unreachable: number } | null;
   swarm: SwarmResult | SwarmSkipped;
   stages: StageRecord[];
   engine: { version: string; rules: number };

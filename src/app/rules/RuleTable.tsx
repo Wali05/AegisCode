@@ -19,7 +19,7 @@ interface Row {
   remediation: string;
 }
 
-const DETECTORS: Array<Detector | "all"> = ["all", "taint", "pattern", "secret", "metric"];
+const DETECTORS: Array<Detector | "all"> = ["all", "taint", "pattern", "secret", "supply", "metric"];
 
 export function RuleTable({ rules }: { rules: Row[] }) {
   const [q, setQ] = useState("");
