@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "scan": "node bin/aegis.mjs scan",
-    "check": "npm run lint && npm run typecheck && npm run test"
+    "check": "npm run lint && npm run typecheck && npm run test",
+    "bench": "tsx bench/run.ts"
   },
   "dependencies": {
     "@google/genai": "^2.30.0",
@@ -35,7 +36,7 @@
     "tailwindcss": "^4",
     "vitest": "^5.0.5"
   },
-  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic → Defender → Judge LLM swarm.",
+  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic \u2192 Defender \u2192 Judge LLM swarm.",
   "license": "MIT",
   "engines": {
     "node": ">=20.9"
