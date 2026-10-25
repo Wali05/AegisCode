@@ -1,0 +1,11 @@
+{
+  "cases": 87,
+  "vulnerable": 52,
+  "precision": 100,
+  "recall": 100,
+  "holdoutFirstRun": {
+    "cases": 26,
+    "precision": 94.1,
+    "recall": 88.9
+  }
+}

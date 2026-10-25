@@ -1,6 +1,6 @@
 import { ImageResponse } from "next/og";
 
-export const alt = "AegisCode — security review that argues with itself";
+export const alt = "AegisCode: security checks for code your AI wrote";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
@@ -23,13 +23,13 @@ export default function Image() {
           AegisCode
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-          <div style={{ fontSize: 76, fontWeight: 700, letterSpacing: -2, lineHeight: 1.05 }}>Security review that</div>
-          <div style={{ fontSize: 76, fontWeight: 700, letterSpacing: -2, lineHeight: 1.05, color: "#c6f432" }}>argues with itself.</div>
+          <div style={{ fontSize: 76, fontWeight: 700, letterSpacing: -2, lineHeight: 1.05 }}>Security checks for code</div>
+          <div style={{ fontSize: 76, fontWeight: 700, letterSpacing: -2, lineHeight: 1.05, color: "#c6f432" }}>your AI wrote.</div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {row("#fb7185", "Critic", "attacks every taint flow the engine found")}
-          {row("#38bdf8", "Defender", "rebuts with evidence from the code")}
-          {row("#a78bfa", "Judge", "rules, patches, and the patch is re-scanned")}
+          {row("#f07c2a", "Traces", "untrusted input across files to the real sink")}
+          {row("#e8417f", "Catches", "imported packages that don't exist")}
+          {row("#c6f432", "Fixes", "and re-scans every fix before offering it")}
         </div>
       </div>
     ),

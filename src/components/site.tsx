@@ -16,6 +16,9 @@ export function Nav() {
           <Link href="/#how" className="hidden rounded-lg px-3 py-1.5 text-fg-2 hover:bg-s2 hover:text-fg sm:inline">
             How it works
           </Link>
+          <Link href="/agents" className="rounded-lg px-3 py-1.5 text-fg-2 hover:bg-s2 hover:text-fg">
+            For agents
+          </Link>
           <Link href="/rules" className="rounded-lg px-3 py-1.5 text-fg-2 hover:bg-s2 hover:text-fg">
             Rules
           </Link>
@@ -35,9 +38,12 @@ export function Footer() {
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-10 text-[12.5px] text-fg-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div className="flex items-center gap-2">
           <Logo className="size-4" />
-          <span>AegisCode — deterministic analysis first, AI second, evidence always.</span>
+          <span>AegisCode: security checks for code your AI wrote.</span>
         </div>
         <div className="flex gap-4">
+          <Link href="/agents" className="hover:text-fg-2">
+            Agent setup
+          </Link>
           <Link href="/rules" className="hover:text-fg-2">
             Rule catalog
           </Link>

@@ -9,15 +9,15 @@ const instrumentSerif = Instrument_Serif({ variable: "--font-instrument-serif", 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
   title: {
-    default: "AegisCode — security review that argues with itself",
+    default: "AegisCode: security checks for code your AI wrote",
     template: "%s · AegisCode",
   },
   description:
-    "An AST taint-analysis engine and an adversarial Critic → Defender → Judge LLM swarm. Every AI claim must quote your source or it is thrown out. SARIF export, OSV dependency intel, verified patches.",
-  keywords: ["SAST", "taint analysis", "code security", "LLM", "multi-agent", "SARIF", "OSV", "DevSecOps"],
+    "Traces untrusted input across files, catches packages AI made up, and writes fixes it re-verifies. Runs inside coding agents over MCP, as a pre-commit hook, in CI and on the web.",
+  keywords: ["SAST", "taint analysis", "AI code security", "MCP", "slopsquatting", "coding agents", "SARIF", "DevSecOps"],
   openGraph: {
-    title: "AegisCode — security review that argues with itself",
-    description: "Deterministic taint analysis + an adversarial AI swarm that has to prove every claim.",
+    title: "AegisCode: security checks for code your AI wrote",
+    description: "Cross-file taint analysis, a package check for hallucinated dependencies, and verified fixes — inside your coding agent, before every commit, and in CI.",
     type: "website",
   },
   twitter: { card: "summary_large_image" },
