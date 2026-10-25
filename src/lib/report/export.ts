@@ -53,7 +53,7 @@ export function toSarif(report: Pick<AuditReport, "findings" | "engine">, uriPre
                   {
                     threadFlows: [
                       {
-                        locations: f.trace.map((s) => ({ location: { ...location(f.file, s.line), message: { text: s.label } } })),
+                        locations: f.trace.map((s) => ({ location: { ...location(s.file ?? f.file, s.line), message: { text: s.label } } })),
                       },
                     ],
                   },
@@ -93,7 +93,7 @@ export function toMarkdown(report: AuditReport): string {
     lines.push(`\`${f.ruleId}\` · ${f.severity} · confidence ${Math.round(f.confidence * 100)}% · ${f.cwe.join(", ")}${f.owasp ? ` · ${f.owasp}` : ""} · \`${f.file}:${f.location.line}\``, "");
     lines.push(f.description, "");
     lines.push("```", f.snippet, "```", "");
-    if (f.trace?.length) lines.push(`**Data flow:** ${f.trace.map((s) => `L${s.line} ${s.label}`).join(" → ")}`, "");
+    if (f.trace?.length) lines.push(`**Data flow:** ${f.trace.map((s) => `${s.file && s.file !== f.file ? `${s.file}:` : "L"}${s.line} ${s.label}`).join(" → ")}`, "");
     lines.push(`**Fix:** ${f.remediation}`, "");
   }
   return lines.join("\n");

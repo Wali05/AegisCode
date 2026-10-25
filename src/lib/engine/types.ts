@@ -53,6 +53,8 @@ export interface TraceStep {
   line: number;
   label: string;
   snippet: string;
+  /** Set when the step lives in a different file from the finding (cross-file flows). */
+  file?: string;
 }
 
 export interface Ruling {

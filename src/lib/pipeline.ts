@@ -1,4 +1,4 @@
-import { scanFile, type EngineStage } from "./engine";
+import { scanProject, type EngineStage } from "./engine";
 import type { FileReport, Finding, Language, Severity } from "./engine/types";
 import { SEVERITIES } from "./engine/types";
 import { compareFindings } from "./engine/finding";
@@ -91,17 +91,26 @@ export async function runAudit(input: AuditInput, deps: PipelineDeps, emit: (e: 
   const reports: FileReport[] = [];
   if (single) for (const s of ENGINE_STAGES) stage(s, "running");
 
-  files.forEach((f, i) => {
-    const onStage = (s: EngineStage) => {
+  const progress = new Set<string>();
+  const projectReports = scanProject(
+    files.map((f) => ({ path: f.path, code: f.content })),
+    {},
+    (s: EngineStage, path: string) => {
       const prev = stageTotals.get(s.stage) ?? { ms: 0, detail: "" };
       stageTotals.set(s.stage, { ms: prev.ms + s.ms, detail: s.detail });
       if (single) stage(s.stage, "done", s.detail, s.ms);
-    };
-    if (!single && i === 0) for (const s of ENGINE_STAGES) stage(s, "running");
-    const report = scanFile(f.path, f.content, {}, onStage);
-    reports.push(report);
-    if (!single) emit({ type: "file", path: f.path, score: report.score, grade: report.grade, findings: report.findings.length, index: i + 1, total: files.length });
-  });
+      else if (!progress.has(path)) {
+        if (!progress.size) for (const st of ENGINE_STAGES) stage(st, "running");
+        progress.add(path);
+      }
+    }
+  );
+  reports.push(...projectReports);
+  if (!single) {
+    reports.forEach((r, i) => emit({ type: "file", path: r.path, score: r.score, grade: r.grade, findings: r.findings.length, index: i + 1, total: reports.length }));
+    const crossFile = reports.flatMap((r) => r.findings).filter((f) => f.trace?.some((st) => st.file && st.file !== f.file)).length;
+    if (crossFile) log("info", "engine", `Followed ${crossFile} data flow${crossFile === 1 ? "" : "s"} across file boundaries.`);
+  }
 
   if (!single) {
     const all = reports.flatMap((r) => r.findings);

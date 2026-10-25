@@ -30,7 +30,11 @@ export function TraceView({ finding }: { finding: Finding }) {
             <span className={cn("z-10 mt-0.5 flex size-[19px] shrink-0 items-center justify-center rounded-full border-2 bg-s1 text-[9px] font-bold", color)}>{s.kind === "source" ? "S" : s.kind === "sink" ? "!" : <ArrowDown className="size-2.5" />}</span>
             <div className="min-w-0">
               <div className="text-[12.5px] text-fg">
-                <span className="font-mono text-fg-3">L{s.line}</span> · {s.label}
+                <span className="font-mono text-fg-3">
+                  {s.file && s.file !== finding.file ? `${s.file.split("/").slice(-2).join("/")}:` : "L"}
+                  {s.line}
+                </span>{" "}
+                · {s.label}
               </div>
               <code className="mt-0.5 block truncate font-mono text-[11.5px] text-fg-2">{s.snippet}</code>
             </div>

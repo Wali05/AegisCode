@@ -77,6 +77,58 @@ const PHP: LexConfig = {
   ],
 };
 
+/**
+ * Splits an expression into the operands joined at the top level by string
+ * concatenation / formatting (`.` in PHP, `+` and `%` in Python, `,` in both).
+ */
+export function operands(expr: string, lang: Language): string[] {
+  const seps = lang === "php" ? ".," : "+%,";
+  const out: string[] = [];
+  let depth = 0;
+  let quote: string | null = null;
+  let cur = "";
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i];
+    if (quote) {
+      cur += c;
+      if (c === "\\") cur += expr[++i] ?? "";
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      cur += c;
+      continue;
+    }
+    if ("([{".includes(c)) depth++;
+    if (")]}".includes(c)) depth--;
+    // A PHP "." between digits is a decimal point, not concatenation.
+    const decimal = c === "." && /\d/.test(expr[i - 1] ?? "") && /\d/.test(expr[i + 1] ?? "");
+    if (depth === 0 && seps.includes(c) && !decimal && !(c === "." && expr[i + 1] === "=")) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+/** True when `op` is entirely one sanitiser call (`intval(...)`, `html.escape(...)`) or a PHP numeric cast. */
+function wrappedBy(op: string, sanitizers: RegExp): boolean {
+  const m = new RegExp(`^(?:${sanitizers.source})`).exec(op);
+  if (!m) return false;
+  if (/^\((?:int|float|bool)\)/.test(m[0])) return true;
+  // The sanitiser's opening paren must close at the very end of the operand.
+  let depth = 0;
+  for (let i = m[0].length - 1; i < op.length; i++) {
+    if (op[i] === "(") depth++;
+    else if (op[i] === ")" && --depth === 0) return i === op.trimEnd().length - 1;
+  }
+  return false;
+}
+
 /** Returns the text of each top-level argument starting at `open` (index just past '('). */
 function splitArgs(text: string, open: number): { args: string[]; full: string } {
   const args: string[] = [];
@@ -123,13 +175,18 @@ export function lexicalTaint(views: SourceViews, lang: Language, file: string): 
   const findings: Finding[] = [];
   const seen = new Set<string>();
 
+  const rawTaint = (expr: string): TraceStep[] | null => {
+    for (const src of cfg.sources) if (src.re.test(expr)) return [];
+    for (const [name, trace] of tainted) if (cfg.varRef(name).test(expr)) return trace;
+    return null;
+  };
+
+  // An expression is tainted if any concatenated operand is, unless that operand is wrapped whole in a sanitiser.
   const taintOf = (expr: string): TraceStep[] | null => {
-    if (cfg.sanitizers.test(expr) && !/[+.%]|\bf['"]|format\(/.test(expr.replace(cfg.sanitizers, ""))) return null;
-    for (const src of cfg.sources) {
-      if (src.re.test(expr)) return [];
-    }
-    for (const [name, trace] of tainted) {
-      if (cfg.varRef(name).test(expr)) return trace;
+    for (const op of operands(expr, lang)) {
+      if (wrappedBy(op, cfg.sanitizers)) continue;
+      const t = rawTaint(op);
+      if (t !== null) return t;
     }
     return null;
   };

@@ -28,6 +28,11 @@ export interface PatternRule extends RuleMeta {
   confidence: number;
   /** Extra guard evaluated against the full matched line (text view). */
   where?: (line: string) => boolean;
+  /**
+   * The AST taint engine models this sink. When it ran and found no tainted data
+   * reaching the line, the match is kept only as an informational review hint.
+   */
+  taintCovered?: boolean;
 }
 
 type Spec = Omit<PatternRule, "detector" | "description" | "remediation"> & {
@@ -53,6 +58,7 @@ export const PATTERN_RULES: PatternRule[] = [
   ...rules(JS, "injection", [
     {
       id: "AEG-JS-001",
+      taintCovered: true,
       title: "Dynamic code evaluation with eval()",
       severity: "high",
       confidence: 0.6,
@@ -65,6 +71,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-002",
+      taintCovered: true,
       title: "Function constructor builds code from strings",
       severity: "high",
       confidence: 0.55,
@@ -89,6 +96,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-004",
+      taintCovered: true,
       title: "Shell command built from dynamic input",
       severity: "high",
       confidence: 0.65,
@@ -101,6 +109,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-005",
+      taintCovered: true,
       title: "spawn() with shell: true",
       severity: "medium",
       confidence: 0.6,
@@ -113,6 +122,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-019",
+      taintCovered: true,
       title: "SQL query assembled with string interpolation",
       severity: "high",
       confidence: 0.75,
@@ -149,6 +159,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-017",
+      taintCovered: true,
       title: "Regular expression built from a variable",
       severity: "low",
       confidence: 0.4,
@@ -164,6 +175,7 @@ export const PATTERN_RULES: PatternRule[] = [
   ...rules(JS, "xss", [
     {
       id: "AEG-JS-006",
+      taintCovered: true,
       title: "Unescaped HTML written via innerHTML",
       severity: "medium",
       confidence: 0.55,
@@ -176,6 +188,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-007",
+      taintCovered: true,
       title: "document.write / insertAdjacentHTML sink",
       severity: "medium",
       confidence: 0.45,
@@ -188,6 +201,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-JS-008",
+      taintCovered: true,
       title: "dangerouslySetInnerHTML with dynamic content",
       severity: "medium",
       confidence: 0.5,
@@ -438,6 +452,7 @@ export const PATTERN_RULES: PatternRule[] = [
   ...rules(["python"], "injection", [
     {
       id: "AEG-PY-001",
+      taintCovered: true,
       title: "eval() / exec() on a dynamic value",
       severity: "high",
       confidence: 0.6,
@@ -450,6 +465,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PY-004",
+      taintCovered: true,
       title: "subprocess call with shell=True",
       severity: "high",
       confidence: 0.7,
@@ -462,6 +478,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PY-005",
+      taintCovered: true,
       title: "os.system / os.popen command execution",
       severity: "high",
       confidence: 0.6,
@@ -475,6 +492,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PY-006",
+      taintCovered: true,
       title: "SQL built with f-string, % or .format()",
       severity: "high",
       confidence: 0.8,
@@ -487,6 +505,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PY-012",
+      taintCovered: true,
       title: "Server-side template built from a string",
       severity: "medium",
       confidence: 0.55,
@@ -870,6 +889,7 @@ export const PATTERN_RULES: PatternRule[] = [
   ...rules(["php"], "injection", [
     {
       id: "AEG-PHP-001",
+      taintCovered: true,
       title: "eval / assert on a variable",
       severity: "critical",
       confidence: 0.7,
@@ -882,6 +902,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PHP-002",
+      taintCovered: true,
       title: "OS command built from request data",
       severity: "critical",
       confidence: 0.85,
@@ -894,6 +915,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PHP-003",
+      taintCovered: true,
       title: "SQL query contains request data",
       severity: "critical",
       confidence: 0.85,
@@ -906,6 +928,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PHP-004",
+      taintCovered: true,
       title: "include/require with a variable path",
       severity: "high",
       confidence: 0.7,
@@ -919,6 +942,7 @@ export const PATTERN_RULES: PatternRule[] = [
     },
     {
       id: "AEG-PHP-006",
+      taintCovered: true,
       title: "Request data echoed without encoding",
       severity: "high",
       confidence: 0.8,

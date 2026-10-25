@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { scanFile } from "../lib/engine";
+import { scanProject } from "../lib/engine";
 import type { Finding, Severity } from "../lib/engine/types";
 import { SEVERITIES } from "../lib/engine/types";
 import { compareFindings, SEVERITY_RANK } from "../lib/engine/finding";
@@ -104,8 +104,7 @@ export async function main(argv: string[]): Promise<number> {
     const base = isFile ? resolve(root, "..") : root;
     const entries = walk(root);
     const { sources, manifests } = selectFiles(entries, args.maxFiles);
-    for (const e of sources) {
-      const report = scanFile(e.path, readFileSync(join(base, e.path), "utf8"));
+    for (const report of scanProject(sources.map((e) => ({ path: e.path, code: readFileSync(join(base, e.path), "utf8") })))) {
       files++;
       loc += report.metrics.loc;
       findings.push(...report.findings);
@@ -134,7 +133,7 @@ export async function main(argv: string[]): Promise<number> {
       const sev = SEV_COLOR[f.severity](f.severity.toUpperCase().padEnd(8));
       console.log(`${sev} ${c.bold(f.title)}`);
       console.log(`         ${c.dim(`${f.file}:${f.location.line}  ${f.ruleId}  ${f.cwe.join(",")}  conf ${Math.round(f.confidence * 100)}%`)}`);
-      if (f.trace?.length) console.log(`         ${c.gray(f.trace.map((s) => `L${s.line} ${s.label}`).join(" → "))}`);
+      if (f.trace?.length) console.log(`         ${c.gray(f.trace.map((s) => `${s.file && s.file !== f.file ? `${s.file}:` : "L"}${s.line} ${s.label}`).join(" → "))}`);
     }
     if (open.length) console.log("");
   }
