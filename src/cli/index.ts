@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { scanProject } from "../lib/engine";
 import type { Finding, Severity } from "../lib/engine/types";
@@ -13,20 +13,30 @@ import { checkPackages, extractPackageRefs } from "../lib/deps/packages";
 import { detectLanguage } from "../lib/engine/language";
 import { toMarkdown, toSarif } from "../lib/report/export";
 import { ENGINE_VERSION, RULE_COUNT } from "../lib/pipeline";
+import { diffFindings, toBaseline, type BaselineFile } from "../lib/baseline";
+import { repoRoot, scanChanges, type ChangeMode } from "./changes";
 
-const USAGE = `AegisCode ${ENGINE_VERSION} — static security analysis (taint flows, ${RULE_COUNT} rules, secrets, OSV)
+const USAGE = `AegisCode ${ENGINE_VERSION} — static security analysis (taint flows, ${RULE_COUNT} rules, secrets, packages, OSV)
 
 Usage
-  aegis scan <path...> [options]
+  aegis scan [path...] [options]     scan files or folders (default: .)
+  aegis scan --staged                only what you're about to commit; reports new issues only
+  aegis scan --changed               uncommitted changes vs HEAD
+  aegis scan --since <ref>           everything changed since a branch, e.g. --since main
+  aegis hook install [--force]       block commits that add high-severity issues
+  aegis hook uninstall
+  aegis mcp                          run as an MCP server for coding agents (stdio)
 
-Options
-  --sarif <file>      write SARIF 2.1.0 (GitHub Code Scanning)
-  --json <file>       write the full findings as JSON
-  --md <file>         write a Markdown report
-  --fail-on <sev>     exit 1 if an open finding is at or above: critical | high | medium | low
-  --max-files <n>     audit at most n files, ranked by attack surface (default 1000)
-  --no-deps           skip network checks (OSV advisories and the npm / PyPI package check)
-  --quiet             only print the summary line
+Scan options
+  --sarif <file>            write SARIF 2.1.0 (GitHub Code Scanning)
+  --json <file>             write findings as JSON
+  --md <file>               write a Markdown report
+  --fail-on <sev>           exit 1 if a (new) finding is at or above: critical | high | medium | low
+  --baseline <file>         only report findings that aren't in this baseline
+  --write-baseline <file>   save the current findings as a baseline
+  --max-files <n>           scan at most n files, ranked by attack surface (default 1000)
+  --no-deps                 skip network checks (OSV advisories and the npm / PyPI package check)
+  --quiet                   only print the summary line
 `;
 
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -36,6 +46,9 @@ const SEV_COLOR: Record<Severity, (s: string) => string> = { critical: c.red, hi
 
 interface Args {
   paths: string[];
+  mode?: ChangeMode;
+  baseline?: string;
+  writeBaseline?: string;
   sarif?: string;
   json?: string;
   md?: string;
@@ -63,6 +76,11 @@ function parseArgs(argv: string[]): Args {
       args.failOn = v;
     } else if (a === "--max-files") args.maxFiles = Math.max(1, Number(next()) || 1000);
     else if (a === "--no-deps") args.deps = false;
+    else if (a === "--staged") args.mode = { kind: "staged" };
+    else if (a === "--changed") args.mode = { kind: "working" };
+    else if (a === "--since") args.mode = { kind: "since", ref: next() };
+    else if (a === "--baseline") args.baseline = next();
+    else if (a === "--write-baseline") args.writeBaseline = next();
     else if (a === "--quiet") args.quiet = true;
     else if (a.startsWith("--")) throw new Error(`Unknown option ${a}`);
     else args.paths.push(a);
@@ -87,12 +105,35 @@ function walk(root: string): TreeEntry[] {
   return out;
 }
 
+function printFinding(f: Finding, tag = "") {
+  const sev = SEV_COLOR[f.severity](f.severity.toUpperCase().padEnd(8));
+  console.log(`${sev} ${tag}${c.bold(f.title)}`);
+  console.log(`         ${c.dim(`${f.file}:${f.location.line}  ${f.ruleId}  ${f.cwe.join(",")}  conf ${Math.round(f.confidence * 100)}%`)}`);
+  if (f.trace?.length) console.log(`         ${c.gray(f.trace.map((s) => `${s.file && s.file !== f.file ? `${s.file}:` : "L"}${s.line} ${s.label}`).join(" → "))}`);
+}
+
+function blockingExit(findings: Finding[], failOn: Severity | undefined, what: string): number {
+  if (!failOn) return 0;
+  const blocking = findings.filter((f) => f.status !== "dismissed" && SEVERITY_RANK[f.severity] >= SEVERITY_RANK[failOn]);
+  if (!blocking.length) return 0;
+  console.error(c.red(`✖ ${blocking.length} ${what}finding${blocking.length === 1 ? "" : "s"} at or above ${failOn}`));
+  return 1;
+}
+
 export async function main(argv: string[]): Promise<number> {
-  if (argv[0] !== "scan" || argv.includes("--help") || argv.includes("-h")) {
-    process.stdout.write(USAGE);
-    return argv[0] === "scan" || argv.includes("--help") || argv.includes("-h") ? 0 : 2;
+  const [cmd, ...rest] = argv;
+  if (cmd === "mcp") {
+    const { runMcpServer } = await import("./mcp");
+    await runMcpServer();
+    return 0;
   }
-  const args = parseArgs(argv.slice(1));
+  if (cmd === "hook") return hook(rest);
+  if (cmd !== "scan" || argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(USAGE);
+    return cmd === "scan" || argv.includes("--help") || argv.includes("-h") ? 0 : 2;
+  }
+  const args = parseArgs(rest);
+  if (args.mode) return scanChangeSet(args);
   const t0 = performance.now();
   const findings: Finding[] = [];
   const reports: FileReport[] = [];
@@ -142,14 +183,22 @@ export async function main(argv: string[]): Promise<number> {
   const report = { findings, engine: { version: ENGINE_VERSION, rules: RULE_COUNT } };
   const open = findings.filter((f) => f.status !== "dismissed");
 
+  // With a baseline, only findings that aren't in it are reported and can fail the run.
+  let reported = open;
+  if (args.baseline) {
+    const base = JSON.parse(readFileSync(args.baseline, "utf8")) as BaselineFile;
+    const diff = diffFindings(base.findings.map((b) => ({ ...b, status: "open" }) as Finding), open);
+    reported = diff.added;
+    console.log(c.dim(`baseline: ${diff.added.length} new · ${diff.existing.length} known · ${diff.fixed.length} fixed since ${base.createdAt.slice(0, 10)}`));
+  }
+  if (args.writeBaseline) {
+    writeFileSync(args.writeBaseline, JSON.stringify(toBaseline(open), null, 2));
+    console.log(c.dim(`baseline: wrote ${open.length} findings to ${args.writeBaseline}`));
+  }
+
   if (!args.quiet) {
-    for (const f of open) {
-      const sev = SEV_COLOR[f.severity](f.severity.toUpperCase().padEnd(8));
-      console.log(`${sev} ${c.bold(f.title)}`);
-      console.log(`         ${c.dim(`${f.file}:${f.location.line}  ${f.ruleId}  ${f.cwe.join(",")}  conf ${Math.round(f.confidence * 100)}%`)}`);
-      if (f.trace?.length) console.log(`         ${c.gray(f.trace.map((s) => `${s.file && s.file !== f.file ? `${s.file}:` : "L"}${s.line} ${s.label}`).join(" → "))}`);
-    }
-    if (open.length) console.log("");
+    for (const f of reported) printFinding(f);
+    if (reported.length) console.log("");
   }
 
   const score = aggregateScore(reports, depFindings, reports.flatMap((r) => r.findings));
@@ -181,13 +230,58 @@ export async function main(argv: string[]): Promise<number> {
     );
   }
 
-  if (args.failOn) {
-    const threshold = SEVERITY_RANK[args.failOn];
-    const blocking = open.filter((f) => SEVERITY_RANK[f.severity] >= threshold);
-    if (blocking.length) {
-      console.error(c.red(`✖ ${blocking.length} finding${blocking.length === 1 ? "" : "s"} at or above ${args.failOn}`));
+  return blockingExit(reported, args.failOn, args.baseline ? "new " : "");
+}
+
+async function scanChangeSet(args: Args): Promise<number> {
+  const t0 = performance.now();
+  const res = await scanChanges(process.cwd(), args.mode!, { packages: args.deps });
+  if (!args.quiet) {
+    for (const f of res.added) printFinding(f, c.red("NEW "));
+    if (res.added.length) console.log("");
+  }
+  const sev = SEVERITIES.map((s) => `${SEV_COLOR[s](String(res.added.filter((f) => f.severity === s).length))} ${s}`).join(c.dim(" · "));
+  console.log(
+    `${c.lime("aegis")} ${res.files.length} changed file${res.files.length === 1 ? "" : "s"} (${res.headLabel} vs ${res.baseLabel}) · ${c.bold(String(res.added.length))} new: ${sev} · ${c.lime(String(res.fixed.length))} fixed · ${res.existing.length} pre-existing · ${Math.round(performance.now() - t0)} ms`
+  );
+  const report = { findings: res.added, engine: { version: ENGINE_VERSION, rules: RULE_COUNT } };
+  if (args.sarif) writeFileSync(args.sarif, JSON.stringify(toSarif(report), null, 2));
+  if (args.json) writeFileSync(args.json, JSON.stringify({ ...report, fixed: res.fixed, existing: res.existing }, null, 2));
+  return blockingExit(res.added, args.failOn, "new ");
+}
+
+const HOOK_MARKER = "# installed by aegiscode";
+
+function hook(argv: string[]): number {
+  const [action] = argv;
+  const root = repoRoot(process.cwd());
+  const path = join(root, ".git", "hooks", "pre-commit");
+  if (action === "install") {
+    if (existsSync(path) && !readFileSync(path, "utf8").includes(HOOK_MARKER) && !argv.includes("--force")) {
+      console.error(c.yellow(`A pre-commit hook already exists at ${path}. Re-run with --force to replace it.`));
       return 1;
     }
+    const bin = resolve(process.argv[1]);
+    writeFileSync(
+      path,
+      `#!/bin/sh
+${HOOK_MARKER}
+# Blocks commits that add new issues at or above AEGIS_FAIL_ON (default: high).
+# Bypass once with: git commit --no-verify
+exec node "${bin}" scan --staged --fail-on "\${AEGIS_FAIL_ON:-high}"
+`
+    );
+    chmodSync(path, 0o755);
+    console.log(`${c.lime("aegis")} pre-commit hook installed → ${relative(process.cwd(), path)}`);
+    return 0;
   }
-  return 0;
+  if (action === "uninstall") {
+    if (existsSync(path) && readFileSync(path, "utf8").includes(HOOK_MARKER)) {
+      unlinkSync(path);
+      console.log(`${c.lime("aegis")} pre-commit hook removed`);
+    } else console.log("No AegisCode hook installed.");
+    return 0;
+  }
+  process.stdout.write(USAGE);
+  return 2;
 }
