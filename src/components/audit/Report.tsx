@@ -27,6 +27,7 @@ export function Report({ report, onReset }: { report: AuditReport; onReset: () =
 
   const open = report.findings.filter((f) => f.status !== "dismissed");
   const flows = open.filter((f) => f.detector === "taint").length;
+  const verifiedFixes = open.filter((f) => f.fix?.verified).length;
   const { target, summary } = report;
 
   const jump = (f: Finding) => {
@@ -105,6 +106,7 @@ export function Report({ report, onReset }: { report: AuditReport; onReset: () =
           <SeverityBar counts={summary.counts} />
           <div className="flex flex-wrap gap-2 text-[12px]">
             <Chip>{flows} source→sink flow{flows === 1 ? "" : "s"}</Chip>
+            {verifiedFixes > 0 && <Chip>{verifiedFixes} verified fix{verifiedFixes === 1 ? "" : "es"}</Chip>}
             <Chip>{report.engine.rules} rules · engine v{report.engine.version}</Chip>
             {summary.dismissed > 0 && <Chip>{summary.dismissed} dismissed as false positives</Chip>}
             {report.dependencies && <Chip>{report.dependencies.scanned} packages checked on OSV</Chip>}

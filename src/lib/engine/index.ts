@@ -10,12 +10,14 @@ import { computeMetrics } from "./metrics";
 import { analyzeQuality, lexicalQuality } from "./quality";
 import { dedupeFindings } from "./finding";
 import { PATTERN_RULES } from "./rules/patterns";
+import { suggestFixes } from "./fixes";
 import { gradeFor, securityScore, triage } from "./score";
 
 export * from "./types";
 export { detectLanguage, LANGUAGE_LABELS } from "./language";
 export { securityScore, gradeFor } from "./score";
 export { ProjectIndex } from "./taint/project";
+export { applyEdits } from "./fixes";
 
 export interface ScanOptions {
   language?: Language;
@@ -116,11 +118,16 @@ function demoteUntraced(patterns: Finding[], taint: Finding[]): Finding[] {
  * between the files, and findings are filed under the file that contains the
  * sink (cross-file flows are discovered while analysing the caller).
  */
-export function scanProject(files: Array<{ path: string; code: string }>, opts: Omit<ScanOptions, "project"> = {}, onStage?: (s: EngineStage, path: string) => void): FileReport[] {
+export function scanProject(files: Array<{ path: string; code: string }>, opts: Omit<ScanOptions, "project"> & { fixes?: boolean } = {}, onStage?: (s: EngineStage, path: string) => void): FileReport[] {
   const jsFiles = files.filter((f) => isJsFamily(detectLanguage(f.path, f.code)));
   const project = jsFiles.length > 1 ? new ProjectIndex(jsFiles) : undefined;
   const reports = files.map((f) => scanFile(f.path, f.code, { ...opts, project }, onStage ? (s) => onStage(s, f.path) : undefined));
-  if (!project) return reports;
+  const withFixes = () => {
+    if (opts.fixes === false) return reports;
+    for (const r of reports) attachFixes(r, files.find((f) => f.path === r.path)!.code, project);
+    return reports;
+  };
+  if (!project) return withFixes();
 
   const byPath = new Map(reports.map((r) => [r.path, r]));
   const moved = new Map<string, Finding[]>();
@@ -140,7 +147,17 @@ export function scanProject(files: Array<{ path: string; code: string }>, opts: 
     r.grade = gradeFor(r.score);
     r.triage = triage(r.path, r.findings, r.metrics);
   }
-  return reports;
+  return withFixes();
+}
+
+/** Adds a verified quick fix to every finding in `report` that has one (in place). */
+export function attachFixes(report: FileReport, code: string, project?: ProjectIndex): FileReport {
+  const fixes = suggestFixes(report, code, (patched) => scanFile(report.path, patched, { language: report.language, project }).findings);
+  for (const f of report.findings) {
+    const fix = fixes.get(f.id);
+    if (fix) f.fix = fix;
+  }
+  return report;
 }
 
 const SUPPRESS = /aegis-ignore(-file)?(?:[:\s]+((?:AEG-[\w-]+|GHSA-[\w-]+|CVE-[\d-]+)(?:\s*,\s*(?:AEG-[\w-]+|GHSA-[\w-]+|CVE-[\d-]+))*))?(?:\s+--\s*(.*?))?(?:\*\/|-->|$)/;

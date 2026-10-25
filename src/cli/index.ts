@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { scanProject } from "../lib/engine";
+import { applyEdits, scanFile, scanProject } from "../lib/engine";
 import type { Finding, Severity } from "../lib/engine/types";
 import { SEVERITIES } from "../lib/engine/types";
 import { compareFindings, SEVERITY_RANK } from "../lib/engine/finding";
@@ -34,6 +34,7 @@ Scan options
   --fail-on <sev>           exit 1 if a (new) finding is at or above: critical | high | medium | low
   --baseline <file>         only report findings that aren't in this baseline
   --write-baseline <file>   save the current findings as a baseline
+  --fix                     apply quick fixes that passed verification (edits files in place)
   --max-files <n>           scan at most n files, ranked by attack surface (default 1000)
   --no-deps                 skip network checks (OSV advisories and the npm / PyPI package check)
   --quiet                   only print the summary line
@@ -49,6 +50,7 @@ interface Args {
   mode?: ChangeMode;
   baseline?: string;
   writeBaseline?: string;
+  fix: boolean;
   sarif?: string;
   json?: string;
   md?: string;
@@ -59,7 +61,7 @@ interface Args {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { paths: [], maxFiles: 1000, deps: true, quiet: false };
+  const args: Args = { paths: [], maxFiles: 1000, deps: true, quiet: false, fix: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => {
@@ -81,6 +83,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--since") args.mode = { kind: "since", ref: next() };
     else if (a === "--baseline") args.baseline = next();
     else if (a === "--write-baseline") args.writeBaseline = next();
+    else if (a === "--fix") args.fix = true;
     else if (a === "--quiet") args.quiet = true;
     else if (a.startsWith("--")) throw new Error(`Unknown option ${a}`);
     else args.paths.push(a);
@@ -110,6 +113,42 @@ function printFinding(f: Finding, tag = "") {
   console.log(`${sev} ${tag}${c.bold(f.title)}`);
   console.log(`         ${c.dim(`${f.file}:${f.location.line}  ${f.ruleId}  ${f.cwe.join(",")}  conf ${Math.round(f.confidence * 100)}%`)}`);
   if (f.trace?.length) console.log(`         ${c.gray(f.trace.map((s) => `${s.file && s.file !== f.file ? `${s.file}:` : "L"}${s.line} ${s.label}`).join(" → "))}`);
+  if (f.fix?.verified) console.log(`         ${c.lime("✓ verified fix:")} ${f.fix.title} ${c.dim("(aegis scan --fix applies it)")}`);
+}
+
+/**
+ * Applies verified quick fixes in place. Fixes in one file are applied together
+ * when they don't overlap, and the file is re-scanned: anything that still
+ * reports the issue, or introduces a new one, is backed out one fix at a time.
+ */
+function applyVerifiedFixes(reports: FileReport[], base: string): { files: number; fixes: number } {
+  let files = 0;
+  let fixes = 0;
+  for (const r of reports) {
+    const candidates = r.findings.filter((f) => f.fix?.verified && f.file === r.path);
+    if (!candidates.length) continue;
+    const abs = join(base, r.path);
+    const original = readFileSync(abs, "utf8");
+    const ok = (code: string, wanted: Finding[]) => {
+      const after = scanFile(r.path, code, { language: r.language }).findings.filter((f) => f.status !== "dismissed" && f.severity !== "info");
+      const before = new Set(r.findings.map((f) => `${f.ruleId}:${f.location.line}`));
+      const fixedGone = wanted.every((w) => !after.some((a) => a.ruleId === w.ruleId && a.location.line === w.location.line));
+      return fixedGone && after.every((a) => before.has(`${a.ruleId}:${a.location.line}`));
+    };
+    let chosen: Finding[] = [];
+    for (const f of candidates) {
+      const next = [...chosen, f];
+      const edits = next.flatMap((x) => x.fix!.edits).sort((a, b) => a.start - b.start);
+      if (edits.some((e, i) => i > 0 && e.start < edits[i - 1].end)) continue; // overlapping edits
+      if (ok(applyEdits(original, edits), next)) chosen = next;
+    }
+    if (!chosen.length) continue;
+    writeFileSync(abs, applyEdits(original, chosen.flatMap((x) => x.fix!.edits)));
+    files++;
+    fixes += chosen.length;
+    for (const f of chosen) console.log(`${c.lime("fixed")} ${r.path}:${f.location.line} ${f.fix!.title}`);
+  }
+  return { files, fixes };
 }
 
 function blockingExit(findings: Finding[], failOn: Severity | undefined, what: string): number {
@@ -148,11 +187,16 @@ export async function main(argv: string[]): Promise<number> {
     const entries = walk(root);
     const { sources, manifests } = selectFiles(entries, args.maxFiles);
     const sourceFiles = sources.map((e) => ({ path: e.path, code: readFileSync(join(base, e.path), "utf8") }));
-    for (const report of scanProject(sourceFiles)) {
+    const projectReports = scanProject(sourceFiles);
+    for (const report of projectReports) {
       files++;
       loc += report.metrics.loc;
       findings.push(...report.findings);
       reports.push(report);
+    }
+    if (args.fix) {
+      const applied = applyVerifiedFixes(projectReports, base);
+      console.log(c.dim(`fix: applied ${applied.fixes} verified fix${applied.fixes === 1 ? "" : "es"} in ${applied.files} file${applied.files === 1 ? "" : "s"}${applied.fixes ? " — review the diff before committing" : ""}`));
     }
     const manifestPaths = [...manifests.map((m) => m.path), ...(isFile && isManifest(root) ? [entries[0].path] : [])];
     if (args.deps && manifestPaths.length) {

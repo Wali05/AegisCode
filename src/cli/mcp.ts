@@ -3,7 +3,7 @@ import { relative, resolve, sep } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { scanFile, scanProject } from "../lib/engine";
+import { attachFixes, scanFile, scanProject } from "../lib/engine";
 import type { Finding } from "../lib/engine/types";
 import { compareFindings } from "../lib/engine/finding";
 import { checkPackages, extractPackageRefs, type PackageRef } from "../lib/deps/packages";
@@ -27,7 +27,8 @@ export function formatForAgent(findings: Finding[], heading: string): string {
   if (!open.length) return `${heading}\nNo issues found.`;
   const blocks = open.slice(0, MAX_LISTED).map((f) => {
     const flow = f.trace?.length ? `\n  flow: ${f.trace.map((s) => `${s.file && s.file !== f.file ? `${s.file}:` : "L"}${s.line} ${s.label}`).join(" → ")}` : "";
-    return `- [${f.severity.toUpperCase()}] ${f.file}:${f.location.line} ${f.title} (${f.ruleId}${f.cwe[0] ? `, ${f.cwe[0]}` : ""})${flow}\n  fix: ${f.remediation.split("\n")[0]}`;
+    const fix = f.fix?.verified ? `\n  verified fix (${f.fix.title}), replace line ${f.fix.diff.line} with:\n    ${f.fix.diff.added.join("\n    ")}` : `\n  fix: ${f.remediation.split("\n")[0]}`;
+    return `- [${f.severity.toUpperCase()}] ${f.file}:${f.location.line} ${f.title} (${f.ruleId}${f.cwe[0] ? `, ${f.cwe[0]}` : ""})${flow}${fix}`;
   });
   const more = open.length > MAX_LISTED ? `\n…and ${open.length - MAX_LISTED} more.` : "";
   return `${heading}\n${blocks.join("\n")}${more}`;
@@ -57,7 +58,7 @@ export function createServer(root = process.cwd()): McpServer {
       },
     },
     async ({ code, filename }) => {
-      const report = scanFile(filename, code);
+      const report = attachFixes(scanFile(filename, code), code);
       const refs = extractPackageRefs(filename, code, report.language);
       const pkg = refs.length ? await checkPackages(refs) : { findings: [] as Finding[] };
       return text(formatForAgent([...report.findings, ...pkg.findings], `AegisCode: ${filename} — score ${report.score}/100 (${report.grade})`));

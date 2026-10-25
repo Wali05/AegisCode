@@ -269,6 +269,17 @@ export function verifyPatch(report: FileReport, patched: string, merged: Finding
   const dismissed = new Set(merged.filter((f) => f.status === "dismissed").map(key));
   const afterFindings = scanned.findings.map((f) => (dismissed.has(key(f)) ? { ...f, status: "dismissed" as const } : f));
   const afterScore = securityScore(afterFindings);
+  // Per finding: is it still in the patched file? Matched on rule + where the data comes from,
+  // since the patch changes the sink line itself.
+  const matchKey = (f: Finding) => `${f.ruleId}|${(f.trace?.[0]?.snippet ?? f.snippet).replace(/\s+/g, " ").trim()}`;
+  const remaining = new Map<string, number>();
+  for (const f of afterFindings) if (f.status !== "dismissed") remaining.set(matchKey(f), (remaining.get(matchKey(f)) ?? 0) + 1);
+  for (const f of merged) {
+    if (f.detector === "swarm" || f.status === "dismissed" || f.severity === "info") continue;
+    const n = remaining.get(matchKey(f)) ?? 0;
+    f.patchStatus = n > 0 ? "remaining" : "resolved";
+    if (n > 0) remaining.set(matchKey(f), n - 1);
+  }
   // Compare by rule multiset (line numbers shift after patching).
   const beforeHist = ruleHistogram(merged.filter((f) => f.detector !== "swarm"));
   const afterHist = ruleHistogram(afterFindings);

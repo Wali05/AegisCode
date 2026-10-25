@@ -63,6 +63,18 @@ export interface Ruling {
   defenderStance?: "concede" | "dispute" | "mitigate";
 }
 
+/** A deterministic fix for one finding, re-verified by scanning the edited code. */
+export interface FixSuggestion {
+  title: string;
+  explanation: string;
+  diff: { line: number; removed: string[]; added: string[] };
+  /** Character-offset edits against the scanned source, used by `aegis scan --fix`. */
+  edits: Array<{ start: number; end: number; text: string }>;
+  /** True when the re-scan no longer reports the issue and nothing new appeared. */
+  verified: boolean;
+  note: string;
+}
+
 export interface Finding {
   /** Stable fingerprint, independent of run order. */
   id: string;
@@ -83,6 +95,9 @@ export interface Finding {
   trace?: TraceStep[];
   status: FindingStatus;
   ruling?: Ruling;
+  fix?: FixSuggestion;
+  /** Whether the reviewer's patched file still contains this issue. */
+  patchStatus?: "resolved" | "remaining";
 }
 
 export interface FunctionMetric {

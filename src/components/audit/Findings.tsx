@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowDown, Bot, Check, ExternalLink, Fingerprint, GitBranch, KeyRound, Package, PackageSearch, Ruler, Search, ShieldCheck, Workflow, X } from "lucide-react";
+import { ArrowDown, Bot, Check, Copy, ExternalLink, Fingerprint, GitBranch, KeyRound, Package, PackageSearch, Ruler, Search, ShieldCheck, Wand2, Workflow, X } from "lucide-react";
 import type { Detector, Finding, Severity } from "@/lib/engine/types";
 import { SEVERITIES } from "@/lib/engine/types";
 import { CodeView } from "./CodeView";
@@ -46,6 +46,53 @@ export function TraceView({ finding }: { finding: Finding }) {
   );
 }
 
+function FixPanel({ finding }: { finding: Finding }) {
+  const fix = finding.fix!;
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(fix.diff.added.join("\n"));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+  return (
+    <div className={cn("overflow-hidden rounded-xl border", fix.verified ? "border-accent/30" : "border-line")}>
+      <div className={cn("flex flex-wrap items-center gap-2 px-3.5 py-2.5", fix.verified ? "bg-accent/[0.06]" : "bg-s2/50")}>
+        <Wand2 className={cn("size-3.5", fix.verified ? "text-accent" : "text-fg-3")} />
+        <span className="text-[13px] font-medium">{fix.title}</span>
+        <span className={cn("rounded-md px-1.5 py-0.5 text-[11px] ring-1 ring-inset", fix.verified ? "bg-accent/10 text-accent ring-accent/25" : "bg-s3 text-fg-2 ring-line-strong")}>
+          {fix.verified ? "Verified by re-scan" : "Not verified"}
+        </span>
+        <button onClick={copy} className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] text-fg-2 hover:bg-s3 hover:text-fg">
+          {copied ? <Check className="size-3" /> : <Copy className="size-3" />} {copied ? "Copied" : "Copy fix"}
+        </button>
+      </div>
+      <div className="code overflow-x-auto border-y border-line bg-bg/60 py-1.5 text-[12px]">
+        {fix.diff.removed.map((l, i) => (
+          <div key={`r${i}`} className="flex min-w-max bg-sev-critical/[0.07]">
+            <span className="w-10 shrink-0 pr-2 text-right text-fg-3 select-none">{fix.diff.line + i}</span>
+            <span className="w-4 shrink-0 text-sev-critical select-none">−</span>
+            <span className="pr-4 whitespace-pre text-fg-2">{l}</span>
+          </div>
+        ))}
+        {fix.diff.added.map((l, i) => (
+          <div key={`a${i}`} className="flex min-w-max bg-accent/[0.07]">
+            <span className="w-10 shrink-0 pr-2 text-right text-fg-3 select-none">{fix.diff.line + i}</span>
+            <span className="w-4 shrink-0 text-accent select-none">+</span>
+            <span className="pr-4 whitespace-pre text-fg">{l}</span>
+          </div>
+        ))}
+      </div>
+      <p className="px-3.5 py-2.5 text-[12.5px] leading-relaxed text-fg-2">
+        {fix.explanation} <span className={fix.verified ? "text-accent" : "text-sev-medium"}>{fix.note}</span>
+      </p>
+    </div>
+  );
+}
+
 export function FindingDetail({ finding, source, onJump }: { finding: Finding; source?: string; onJump?: (f: Finding) => void }) {
   const D = DETECTOR_META[finding.detector];
   const focus = { start: finding.location.line, end: Math.max(finding.location.line, Math.min(finding.location.endLine, finding.location.line + 8)), trace: finding.trace?.map((t) => t.line) };
@@ -67,6 +114,11 @@ export function FindingDetail({ finding, source, onJump }: { finding: Finding; s
           {finding.status === "confirmed" && (
             <span className="inline-flex items-center gap-1 rounded-md bg-accent/10 px-1.5 py-0.5 text-[11px] text-accent ring-1 ring-accent/25 ring-inset">
               <Check className="size-3" /> Confirmed by swarm
+            </span>
+          )}
+          {finding.patchStatus && (
+            <span className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] ring-1 ring-inset", finding.patchStatus === "resolved" ? "bg-accent/10 text-accent ring-accent/25" : "bg-sev-medium/10 text-sev-medium ring-sev-medium/25")}>
+              <Wand2 className="size-3" /> {finding.patchStatus === "resolved" ? "Resolved by AI patch" : "Still present after AI patch"}
             </span>
           )}
           {isDismissed && (
@@ -102,6 +154,8 @@ export function FindingDetail({ finding, source, onJump }: { finding: Finding; s
           <p className="text-[13px] leading-relaxed text-fg-2">{finding.ruling.rationale}</p>
         </div>
       )}
+
+      {finding.fix && <FixPanel finding={finding} />}
 
       <div className="rounded-xl border border-line bg-s2/50 p-3.5">
         <SectionLabel className="mb-1.5 flex items-center gap-1.5">
@@ -205,6 +259,7 @@ export function FindingsPanel({ findings, sources, onJump }: { findings: Finding
                         <span>{f.cwe[0]}</span>
                         {f.status === "confirmed" && <Check className="size-3 text-accent" aria-label="confirmed" />}
                         {f.trace && <GitBranch className="size-3" aria-label="has data-flow trace" />}
+                        {f.fix?.verified && <Wand2 className="size-3 text-accent" aria-label="verified fix available" />}
                       </div>
                     </div>
                   </div>

@@ -77,7 +77,7 @@ describe("MCP server", () => {
     const client = await connect();
     const out = textOf(await client.callTool({ name: "scan_code", arguments: { filename: "api.ts", code: `app.get("/", (req, res) => res.redirect(req.query.next));` } }));
     expect(out).toMatch(/\[MEDIUM\] api\.ts:1 Open redirect/);
-    expect(out).toContain("fix:");
+    expect(out).toMatch(/verified fix \(Only allow same-site paths\), replace line 1 with:/);
   });
 
   it("refuses paths outside the project and explains rules", async () => {

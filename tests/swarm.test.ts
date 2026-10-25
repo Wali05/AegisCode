@@ -123,6 +123,7 @@ describe("adversarial swarm", () => {
     // The patch is parsed by tsc and re-scanned by the same engine.
     expect(result.patch).toMatchObject({ parses: true, introduced: 0 });
     expect(result.patch!.resolved).toBeGreaterThanOrEqual(1);
+    expect(findings.find((f) => f.id === sql.id)!.patchStatus).toBe("resolved");
     expect(result.patch!.after.score).toBeGreaterThan(result.patch!.before.score);
 
     expect(stages).toEqual(expect.arrayContaining(["critic:done", "defender:done", "judge:done", "verify:done"]));
