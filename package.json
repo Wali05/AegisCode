@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:cli": "node scripts/build-cli.mjs",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "next typegen && tsc --noEmit",
@@ -12,7 +13,9 @@
     "test:watch": "vitest",
     "scan": "node bin/aegis.mjs scan",
     "check": "npm run lint && npm run typecheck && npm run test",
-    "bench": "tsx bench/run.ts"
+    "bench": "tsx bench/run.ts",
+    "prepare": "node scripts/build-cli.mjs",
+    "smoke:mcp": "node scripts/mcp-smoke.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.30.0",
@@ -32,17 +35,27 @@
     "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "esbuild": "^0.25.12",
     "eslint": "^9",
     "eslint-config-next": "16.2.3",
     "tailwindcss": "^4",
     "vitest": "^5.0.5"
   },
-  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic → Defender → Judge LLM swarm.",
+  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic \u2192 Defender \u2192 Judge LLM swarm.",
   "license": "MIT",
   "engines": {
     "node": ">=20.9"
   },
   "bin": {
     "aegis": "bin/aegis.mjs"
-  }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "scripts/build-cli.mjs",
+    "src/cli",
+    "src/lib",
+    "README.md",
+    "LICENSE"
+  ]
 }

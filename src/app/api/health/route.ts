@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, RULE_COUNT } from "@/lib/pipeline";
+import { ENGINE_VERSION, RULE_COUNT } from "@/lib/version";
 import { githubToken, provider } from "@/lib/server/context";
 
 export const runtime = "nodejs";

@@ -12,7 +12,7 @@ import { scanDependencies } from "../lib/deps/osv";
 import { checkPackages, extractPackageRefs } from "../lib/deps/packages";
 import { detectLanguage } from "../lib/engine/language";
 import { toMarkdown, toSarif } from "../lib/report/export";
-import { ENGINE_VERSION, RULE_COUNT } from "../lib/pipeline";
+import { ENGINE_VERSION, RULE_COUNT } from "../lib/version";
 import { diffFindings, toBaseline, type BaselineFile } from "../lib/baseline";
 import { repoRoot, scanChanges, type ChangeMode } from "./changes";
 

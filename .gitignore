@@ -3,6 +3,9 @@ node_modules/
 .pnp
 .pnp.js
 
+# CLI / MCP bundle (built by prepare / build:cli)
+dist/
+
 # Next.js build output
 .next/
 out/

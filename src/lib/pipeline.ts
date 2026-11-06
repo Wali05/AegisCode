@@ -3,22 +3,18 @@ import type { FileReport, Finding, Language, Severity } from "./engine/types";
 import { SEVERITIES } from "./engine/types";
 import { compareFindings } from "./engine/finding";
 import { aggregateScore, gradeFor, securityScore } from "./engine/score";
-import { PATTERN_RULES } from "./engine/rules/patterns";
-import { SECRET_RULES } from "./engine/secrets";
-import { SINKS } from "./engine/taint/model";
-import { QUALITY_RULES } from "./engine/quality";
 import { isManifest, parseManifest } from "./deps/manifests";
 import { scanDependencies } from "./deps/osv";
-import { checkPackages, extractPackageRefs, PACKAGE_RULE_LIST } from "./deps/packages";
+import { checkPackages, extractPackageRefs } from "./deps/packages";
 import { detectLanguage } from "./engine/language";
 import { GitHubClient, GitHubError, parseGitHubUrl, selectFiles } from "./github";
 import type { LlmProvider } from "./swarm/provider";
 import { runSwarm } from "./swarm/run";
 import { mapLimit } from "./util/concurrency";
 import type { AuditReport, AuditTarget, PipelineEvent, StageId, StageRecord, StageStatus, SwarmResult, SwarmSkipped } from "./report/types";
+import { ENGINE_VERSION, RULE_COUNT } from "./version";
 
-export const ENGINE_VERSION = "2.0.0";
-export const RULE_COUNT = PATTERN_RULES.length + SECRET_RULES.length + new Set(SINKS.map((s) => s.id)).size + Object.keys(QUALITY_RULES).length + PACKAGE_RULE_LIST.length;
+export { ENGINE_VERSION, RULE_COUNT };
 
 export type SwarmMode = "auto" | "force" | "off";
 

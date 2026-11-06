@@ -9,7 +9,7 @@ import { compareFindings } from "../lib/engine/finding";
 import { checkPackages, extractPackageRefs, type PackageRef } from "../lib/deps/packages";
 import { detectLanguage } from "../lib/engine/language";
 import { ruleCatalog } from "../lib/catalog";
-import { ENGINE_VERSION } from "../lib/pipeline";
+import { ENGINE_VERSION } from "../lib/version";
 import { scanChanges } from "./changes";
 
 /**

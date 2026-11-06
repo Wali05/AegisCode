@@ -89,20 +89,46 @@ It currently gets all 87 right. That number flatters it, though: I wrote most of
 
 ## Using it with a coding agent
 
-Clone it once somewhere on your machine:
+The usual path is a one-liner. No manual clone needed for everyday MCP use:
+
+Claude Code:
+
+```bash
+claude mcp add aegiscode -- npx -y -p github:Wali05/AegisCode aegis mcp
+```
+
+Cursor (`.cursor/mcp.json` in your project, or the global one):
+
+```json
+{
+  "mcpServers": {
+    "aegiscode": {
+      "command": "npx",
+      "args": ["-y", "-p", "github:Wali05/AegisCode", "aegis", "mcp"]
+    }
+  }
+}
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.aegiscode]
+command = "npx"
+args = ["-y", "-p", "github:Wali05/AegisCode", "aegis", "mcp"]
+```
+
+The first run can take a minute while npm installs dependencies and `prepare` builds the CLI bundle. Later runs reuse the cache. `check_packages` needs network access to npm / PyPI; the other tools are local.
+
+If you are hacking on AegisCode itself, or you want the web app, clone instead:
 
 ```bash
 git clone https://github.com/Wali05/AegisCode.git ~/aegiscode
 cd ~/aegiscode && npm ci
-```
-
-Then add it as an MCP server. For Claude Code:
-
-```bash
 claude mcp add aegiscode -- node ~/aegiscode/bin/aegis.mjs mcp
 ```
 
-Cursor (`.cursor/mcp.json`) and Codex (`~/.codex/config.toml`) take the same command and arguments. The [/agents](src/app/agents/page.tsx) page in the app has copy-paste config for each.
+The [/agents](src/app/agents/page.tsx) page in the app has the same configs.
 
 <img src="docs/screenshots/agents.png" alt="Agent setup page" width="900" />
 
@@ -122,7 +148,10 @@ Since agents don't always follow instructions, there's also a git hook:
 
 ```bash
 cd your-project
+# from a clone:
 node ~/aegiscode/bin/aegis.mjs hook install
+# or after an npx install has cached the package:
+npx -y -p github:Wali05/AegisCode aegis hook install
 ```
 
 It scans staged changes and blocks the commit if they add anything high or critical (`AEGIS_FAIL_ON=medium` makes it stricter). `git commit --no-verify` skips it once.

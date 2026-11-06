@@ -39,24 +39,24 @@ export default function AgentsPage() {
           Put a checkpoint <span className="font-serif font-normal text-fg-2 italic">in front of your agent.</span>
         </h1>
         <p className="mt-4 max-w-2xl text-[15px] leading-relaxed text-fg-2">
-          Everything below runs locally from a clone of the repository. Only the package check talks to the network (the npm and PyPI registries). The optional AI review lives in the web app.
+          Everyday MCP use is a one-liner via npx. Only the package check talks to the network (the npm and PyPI registries). The optional AI review lives in the web app.
         </p>
 
-        <Section title="1. Get the code">
-          <CodeBlock code={`git clone ${REPO_URL}.git ~/aegiscode\ncd ~/aegiscode && npm ci`} />
-        </Section>
-
-        <Section title="2. Connect your agent over MCP">
+        <Section title="1. Connect your agent over MCP">
           <p>Claude Code:</p>
-          <CodeBlock code={`claude mcp add aegiscode -- node ~/aegiscode/bin/aegis.mjs mcp`} />
+          <CodeBlock code={`claude mcp add aegiscode -- npx -y -p github:Wali05/AegisCode aegis mcp`} />
           <p>Cursor (<code className="font-mono text-fg">.cursor/mcp.json</code> in your project, or the global one):</p>
           <CodeBlock
             label="json"
-            code={JSON.stringify({ mcpServers: { aegiscode: { command: "node", args: ["/Users/you/aegiscode/bin/aegis.mjs", "mcp"] } } }, null, 2)}
+            code={JSON.stringify({ mcpServers: { aegiscode: { command: "npx", args: ["-y", "-p", "github:Wali05/AegisCode", "aegis", "mcp"] } } }, null, 2)}
           />
           <p>Codex (<code className="font-mono text-fg">~/.codex/config.toml</code>):</p>
-          <CodeBlock label="toml" code={`[mcp_servers.aegiscode]\ncommand = "node"\nargs = ["/Users/you/aegiscode/bin/aegis.mjs", "mcp"]`} />
-          <p>Any other MCP client: run <code className="font-mono text-fg">node bin/aegis.mjs mcp</code> over stdio, from your project folder.</p>
+          <CodeBlock label="toml" code={`[mcp_servers.aegiscode]\ncommand = "npx"\nargs = ["-y", "-p", "github:Wali05/AegisCode", "aegis", "mcp"]`} />
+          <p>The first run can take a minute while npm installs dependencies and builds the CLI. Later runs reuse the cache. Any other MCP client: the same <code className="font-mono text-fg">npx … aegis mcp</code> command over stdio, from your project folder.</p>
+        </Section>
+
+        <Section title="2. Or clone if you are hacking on it">
+          <CodeBlock code={`git clone ${REPO_URL}.git ~/aegiscode\ncd ~/aegiscode && npm ci\nclaude mcp add aegiscode -- node ~/aegiscode/bin/aegis.mjs mcp`} />
         </Section>
 
         <Section title="3. Tell the agent to use it">
@@ -88,7 +88,7 @@ export default function AgentsPage() {
 
         <Section title="4. Block risky commits">
           <p>The hook scans only staged changes and fails only on issues the commit introduces (high and above by default). Skip it once with <code className="font-mono text-fg">git commit --no-verify</code>.</p>
-          <CodeBlock code={`cd your-project\nnode ~/aegiscode/bin/aegis.mjs hook install\n# stricter: AEGIS_FAIL_ON=medium git commit ...`} />
+          <CodeBlock code={`cd your-project\nnode ~/aegiscode/bin/aegis.mjs hook install\n# or: npx -y -p github:Wali05/AegisCode aegis hook install\n# stricter: AEGIS_FAIL_ON=medium git commit ...`} />
         </Section>
 
         <Section title="5. Gate pull requests in CI">
