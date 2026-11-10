@@ -1,6 +1,6 @@
 {
   "name": "aegiscode",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -41,7 +41,7 @@
     "tailwindcss": "^4",
     "vitest": "^5.0.5"
   },
-  "description": "Security review that argues with itself: an AST taint-analysis engine plus an adversarial Critic → Defender → Judge LLM swarm.",
+  "description": "Security checks for code your AI wrote: cross-file taint analysis, a registry check for imported packages, and fixes that are re-scanned before they are shown. Runs as an MCP server, a pre-commit hook, a CI step and a web app.",
   "license": "MIT",
   "engines": {
     "node": ">=20.9"

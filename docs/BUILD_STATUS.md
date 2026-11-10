@@ -1,61 +1,74 @@
-# BUILD_STATUS — 2026-11-06
+# BUILD_STATUS — 2026-11-10 (v2.1.0)
 
 ## What this pass shipped
 
-Npx-ready MCP packaging for AegisCode (Claude Code / Cursor / Codex), without requiring a manual clone + `npm ci` for everyday agent use.
+An accuracy and robustness pass, driven by two new rounds of test cases that were run before anything was changed.
 
-- `scripts/build-cli.mjs` — esbuild bundle of `src/cli` → `dist/cli.mjs` (analyser + MCP only; Next.js / React / LLM swarm stay out of the bundle).
-- `bin/aegis.mjs` — Anvil-style thin wrapper: prefers `dist/cli.mjs`, falls back to tsx for local checkouts without a build.
-- `prepare` / `npm run build:cli` — builds the CLI on install; `npm run build` remains the Next.js web app.
-- `scripts/mcp-smoke.mjs` + `npm run smoke:mcp` — real stdio MCP client (`StdioClientTransport`) against the bin; asserts the five tools and a `scan_code` open-redirect finding.
-- README + `/agents` page lead with the npx one-liner; clone path kept for contributors / web app.
-- `src/lib/version.ts` — `ENGINE_VERSION` / `RULE_COUNT` extracted so the CLI import graph does not pull `src/lib/swarm`.
+**Analyser (JS/TS)**
 
-Package stays `"private": true` (github installs still work; not publishing to the npm registry).
+- Control flow is joined instead of applied in program order: `if`/`else`, `switch` (with fall-through), `try`/`catch`/`finally` and loops. Loop bodies run twice so a value assigned late in one iteration is seen early in the next.
+- Sanitisers are context-aware (`src/lib/engine/taint/model.ts`, `SANITIZERS`): an HTML escaper clears a value for HTML sinks only, `path.basename` for paths only, and so on. Decoding undoes it.
+- Object literals are tracked per field, including destructuring and later writes to a field. `map` / `reduce` use what the callback returns.
+- Sources: NestJS parameter decorators (validating pipes respected), Server Actions, Hono body helpers, GraphQL resolver arguments, and requests recognised by type or position rather than only by the name `req`.
+- Sinks: `spawn("sh", ["-c", x])` and `{ shell: true }`, MongoDB `$where`, query-builder `.where()` strings, `Location` headers, and `promisify(exec)` / renamed imports.
+- Guards: Zod schemas, literal `case` clauses, `postMessage` origin checks, calls that never return (`notFound()`), short-circuit `&&` / `||`. Regex guards must anchor every alternative.
+- Calls into the project's own classes resolve through declared types, in the same file and across files (`ProjectIndex` publishes `Class.method` summaries).
 
-## Verification (this machine, Asia/Calcutta)
+**Analyser (Python / PHP)**: multi-line calls are read as one statement, Python locals stay inside their function, Flask / FastAPI route parameters are sources, PHP `<?= ?>` is an echo sink.
+
+**Fixes**: the SQL fixer only binds an expression where a single value can go. Before, it would rewrite `"… FROM posts " + where + " ORDER BY x " + dir` into `"… posts ? ORDER BY x ?", [where, dir]` and mark it verified.
+
+**CLI / MCP**
+
+- Change scans follow renames (a renamed file's existing issues were all reported as new) and read paths with `-z` (non-ASCII file names were silently skipped).
+- Dangling symlinks and link loops no longer abort a scan.
+- MCP `scan_paths` checks the real path, so a symlink inside the project can't be used to read outside it.
+
+**Web app**: rate limiter evicts least-recently-used clients instead of clearing all buckets; malformed `RATE_LIMIT_PER_10_MIN` / `MAX_REPO_FILES` fall back to defaults; clearer validation and GitHub rate-limit messages.
+
+**Dependencies**: Next.js 16.2.3 → 16.4.6. `npm audit` went from 17 advisories (1 critical, 5 high) to 8 moderate, all one `minimatch` issue inside the ESLint toolchain (dev only; the fix is a breaking downgrade of `eslint-config-next`).
+
+## Verification (cloud container, Node 22)
 
 ```text
-npm run build:cli
-  → dist/cli.mjs ~246kb, 15ms
-
-npm run smoke:mcp
-  → mcp-smoke ok: 5 tools (check_packages, explain_rule, scan_changes, scan_code, scan_paths);
-     scan_code found [MEDIUM] Open redirect
-
-npm test
-  → Test Files 11 passed (11)
-  → Tests 97 passed (97)
-
-npm run typecheck
-  → next typegen + tsc --noEmit OK
-
-npm pack → install into a fresh temp project
-  → bin --help works; MCP listTools + scan_code open-redirect OK via the installed package
+npm run lint        → clean
+npm run typecheck   → next typegen + tsc --noEmit OK
+npm test            → 12 files, 147 tests passed
+npm run bench       → 202 cases, precision 100% / recall 100%
+npm run build       → next build OK (9 routes)
+npm run smoke:mcp   → 5 tools; scan_code found [MEDIUM] Open redirect
+node bin/aegis.mjs scan src --no-deps --fail-on high → exit 0 (score 95, 0 critical, 0 high)
 ```
 
-`next build` was not re-run this pass (typecheck covers the TS surface; web `build` script unchanged).
+First-run scores of the new rounds, before their misses were fixed (see `bench/RESULTS.md`):
 
-## Working MCP install command
-
-After this commit is on `main` at github.com/Wali05/AegisCode:
-
-```bash
-claude mcp add aegiscode -- npx -y -p github:Wali05/AegisCode aegis mcp
+```text
+round 2 (67 cases)  precision 82.9%  recall 61.7%   against the v2.0.0 engine
+round 3 (48 cases)  precision 91.3%  recall 77.8%   against the rewritten engine
 ```
 
-Verified locally against a packed install of this tree (`npm pack` + install), and against `node bin/aegis.mjs mcp` via `npm run smoke:mcp`. Live `npx … github:Wali05/AegisCode` was not re-hit here because this commit is not pushed yet.
+Old engine vs new on real repositories (taint findings, matched by rule + file + line):
 
-From a clone (also verified):
-
-```bash
-node bin/aegis.mjs mcp
+```text
+OWASP Juice Shop   44 → 46   +2 NoSQL injection via $where (routes/showProductReviews.ts, routes/trackOrder.ts)
+OWASP NodeGoat      5 →  5   no change
+DVWA               55 → 54   -1 (login.php:47, a query whose inputs are escaped with mysqli_real_escape_string)
+Express             8 →  6   -3 redirects to a fixed "/user/" prefix, +1 res.location() in a test
 ```
+
+The web app was driven in a headless browser at 1440×900 and at phone size: no console errors, no horizontal overflow, and a pasted snippet audits end to end.
+
+## Not verified here
+
+- Repository scans through the web app: the GitHub API was rate-limited in this container, so only the pasted-code path was exercised end to end. The GitHub client itself is covered by the mocked tests.
+- The AI review (no `GEMINI_API_KEY` here); it is covered by the scripted-model tests.
+- CI on GitHub: the workflow runs on pushes to `main` and on pull requests, and this work is on a branch without one.
+- `debate.png` and `patch.png` in `docs/screenshots` are from the previous pass.
 
 ## Known limits
 
-- Private package: install via `github:Wali05/AegisCode`, not the npm registry.
-- First npx run pulls the full dependency tree (including Next.js for the web app) and runs `prepare` to build `dist/cli.mjs`; that can take a minute. Later runs reuse the npm cache.
-- On this box, npm's `allowScripts` can block `prepare` / esbuild postinstall; the bin then falls back to tsx when `dist/` is missing. Normal user installs run `prepare`.
-- `check_packages` needs network (npm / PyPI). Other MCP tools are local.
-- Analyser accuracy limits are unchanged; see README "How accurate is it?".
+- Class resolution needs declared types (`new C()`, `: C`, constructor parameter properties). Untyped JS that passes services around isn't followed.
+- Schema support is Zod only.
+- Unrecognised sanitiser names (`sanitize(x)`, `clean(x)`) still clear a value for every sink.
+- Python and PHP analysis stays inside one file.
+- The benchmark is hand-written; the first-run column is the estimate for unseen code.

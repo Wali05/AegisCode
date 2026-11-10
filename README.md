@@ -42,9 +42,25 @@ CRITICAL SQL injection: HTTP request input (from api.ts) → line 2
          → L2 reaches sql injection sink
 ```
 
-It also understands the checks people actually write before using input: allowlists (`ALLOWED.has(x)`), anchored regexes, `typeof` checks, equality against constants, `startsWith("/")` on paths, `isValidX()` and `validateX()` helpers, and ternaries. If the dangerous call is only reachable after one of those, it isn't reported. This removed most of the false positives I was getting from real projects.
+It also understands the checks people actually write before using input: allowlists (`ALLOWED.has(x)`), anchored regexes, `typeof` checks, equality against constants, `case` clauses, `startsWith("/")` on paths, `isValidX()` and `validateX()` helpers, ternaries, and Zod schemas (a field declared `z.enum([...])` or `z.coerce.number()` comes out of `.parse()` clean, a plain `z.string()` doesn't). If the dangerous call is only reachable after one of those, it isn't reported. This removed most of the false positives I was getting from real projects.
 
-Python and PHP use a simpler line-by-line version of the same idea. Go, Java, Ruby, C#, Rust, C/C++ and shell get pattern rules.
+Three things it is careful about, because getting them wrong is how a scanner ends up either noisy or blind:
+
+- **Branches are joined, not overwritten.** `if`/`else`, `switch`, `try`/`catch` and loops are analysed per branch. A variable is tainted afterwards if it is tainted on *any* path that reaches the code, and clean only if every path validated or replaced it.
+
+  ```ts
+  let sql;
+  if (req.query.raw) sql = "SELECT * FROM t WHERE " + req.query.raw;
+  else sql = "SELECT * FROM t";
+  db.query(sql); // reported: the first branch reaches here
+  ```
+
+- **An escaper only counts for its own context.** `escapeHtml(x)` makes a value safe to put in HTML. It does nothing for a SQL query, and `path.basename(x)` does nothing for a shell command, so those still get reported, with the mismatch spelled out in the trace (`escaped by escapeHtml() for HTML only`).
+- **Objects are tracked per field.** `{ host: "api.internal", token: req.headers.authorization }` has one tainted field, and using `cfg.host` in a URL is fine.
+
+It knows where request data comes from in Express, Koa, Fastify, Hono, Next.js route handlers and Server Actions, NestJS (`@Query()`, `@Body()`, with `ParseIntPipe` and friends respected), GraphQL resolvers and Lambda handlers, and it follows calls into your own classes: `this.users.findByName(x)` is resolved through the declared type of `users` to that class's method, in the same file or an imported one.
+
+Python and PHP use a lighter statement-based version of the same idea: calls spread over several lines are read as one statement, variables stay inside their function, and Flask/FastAPI route parameters count as input. Go, Java, Ruby, C#, Rust, C/C++ and shell get pattern rules.
 
 ### Catches packages that don't exist
 
@@ -64,7 +80,7 @@ If the registry can't be reached, those packages are listed as "not checked", no
 
 ### Suggests fixes, and checks them first
 
-For the common cases there's a fix: parameterised SQL, `textContent` instead of `innerHTML`, `path.basename` for file paths, `String()` around Mongo filter values, local-only redirects, and turning TLS verification back on. Each fix is applied to a copy of the file, which is then scanned again. It's only shown as verified if the issue is gone from that line *and* nothing new appeared. The fixers are deliberately conservative: if the SQL isn't a plain query string, or the "user input" is a table name in an `ORDER BY`, there's no fix, because the honest answer there is "rewrite this".
+For the common cases there's a fix: parameterised SQL, `textContent` instead of `innerHTML`, `path.basename` for file paths, `String()` around Mongo filter values, local-only redirects, and turning TLS verification back on. Each fix is applied to a copy of the file, which is then scanned again. It's only shown as verified if the issue is gone from that line *and* nothing new appeared. The fixers are deliberately conservative. A value is only turned into a bound parameter where a single value can go (after `=`, `LIKE`, `LIMIT`, inside `VALUES (...)` or `IN (...)`). If the "user input" is a column in an `ORDER BY`, a whole `WHERE` clause spliced in from a variable, or the call is a `prepare()` whose values are passed later, there's no fix, because the honest answer there is "rewrite this".
 
 <img src="docs/screenshots/fix.png" alt="A finding with a verified fix" width="900" />
 
@@ -83,9 +99,22 @@ Nobody fixes 300 old findings before their next commit, so the agent-facing mode
 
 ## How accurate is it?
 
-`bench/` holds 87 small hand-labelled cases: 52 vulnerable, and 35 safe ones written to look dangerous (validated input, parameterised queries, allowlisted redirects). `npm run bench` runs them and writes [bench/RESULTS.md](bench/RESULTS.md).
+`bench/` holds 202 small hand-labelled cases: 126 vulnerable, and 76 safe ones written to look dangerous (validated input, parameterised queries, allowlisted redirects). `npm run bench` runs them and writes [bench/RESULTS.md](bench/RESULTS.md).
 
-It currently gets all 87 right. That number flatters it, though: I wrote most of those cases while tuning the engine, so they work as a regression suite more than an independent score. To keep myself honest, I wrote 26 more cases *after* the engine was done and ran them once before changing anything. That first run scored **94.1% precision and 88.9% recall**: one false alarm and two misses. Those three are fixed now, so the held-out set passes too. Treat roughly 90% as the realistic number on code it hasn't seen. The test suite fails if either score drops below 95% on the full set.
+It currently gets all 202 right. That number flatters it, because every case it ever missed was fixed afterwards. The numbers worth reading are the ones from the first time each batch was run, before anything was changed:
+
+| Round | Cases | Written | First run: precision / recall |
+|---|---:|---|---:|
+| Tuning set | 61 | alongside the first engine | n/a (regression suite) |
+| Held-out round 1 | 26 | after the first engine was done | 94.1% / 88.9% |
+| Round 2 | 67 | to break it on purpose | 82.9% / 61.7% |
+| Round 3 | 48 | after the rewrite round 2 forced | 91.3% / 77.8% |
+
+Round 2 is the interesting one. It went looking for what the first held-out set was too polite to ask (a value tainted in one branch and overwritten in the other, an HTML escaper used on a SQL string, NestJS and Server Actions) and recall fell to 62%. That led to rewriting the flow analysis: branch joins, context-aware sanitisers, per-field objects. Round 3 then checked the rewrite on patterns it hadn't been tuned for and found six more misses, mostly calls into class-based services, which are fixed now too.
+
+So treat roughly **90% precision and 80% recall** as the realistic figure on code it hasn't seen, not 100%. The test suite fails if either score drops below 95% on the full set, and `npm run bench` refuses to run if cases are added without recording their first-run score.
+
+Beyond the labelled cases, the rewrite was diffed against the previous engine on real repositories (OWASP Juice Shop, NodeGoat, DVWA, Express). It found the two `$where` NoSQL injections in Juice Shop that the old engine walked past, dropped three "open redirect" reports in Express's examples that were redirects to a fixed `/user/` prefix, and changed nothing in NodeGoat.
 
 ## Using it with a coding agent
 
@@ -238,11 +267,13 @@ tests/              vitest
 
 ## Limitations
 
-- Cross-file tracking covers JS/TS. Python and PHP flows stay inside one file and use the lighter line-based analysis.
+- Cross-file tracking covers JS/TS. Python and PHP flows stay inside one file and use the lighter statement-based analysis.
 - It doesn't run your code, so anything decided at runtime (dynamic `require`, values from a database, framework magic it doesn't know about) is invisible to it.
-- The guard detection covers the common patterns, not every possible validation, which is why findings carry a confidence value.
+- Calls into classes are resolved from what the code declares (`new UserService()`, `private users: UserService`). Untyped JavaScript that passes a service around as a plain argument isn't followed, and neither is dependency injection by string token.
+- The guard detection covers the common patterns, not every possible validation, which is why findings carry a confidence value. Schema support is Zod only; a Joi or Yup schema is treated as an unknown function.
+- A sanitiser the engine can't place (`sanitize(x)`, `clean(x)`) gets the benefit of the doubt and clears the value for every sink.
 - The package check needs network access. In a locked-down environment those packages are reported as not checked.
-- The benchmark is mine. It's small and I wrote it, so read the held-out number, not the headline one.
+- The benchmark is mine. It's small and hand-written, so read the first-run numbers, not the headline one.
 - The web app's cache and rate limiter are in memory. That's fine for one server, but more than one would need something like Redis.
 
 ## Scripts
