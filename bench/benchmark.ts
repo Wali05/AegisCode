@@ -120,6 +120,18 @@ export function runBenchmark(root = join(process.cwd(), "bench/cases")): Benchma
   };
 }
 
+/**
+ * How the corpus grew. The first-run scores are recorded by hand at the time a
+ * round is added (the engine that produced them no longer exists once the
+ * misses are fixed), so they are history, not something `npm run bench` can recompute.
+ */
+export const ROUNDS: Array<{ where: string; cases: number; written: string; precision: number | null; recall: number | null }> = [
+  { where: "Tuning set (`js/`, `py/`, `php/`, `go/`, `c/`, `multi/xfile-*`)", cases: 61, written: "alongside the first engine", precision: null, recall: null },
+  { where: "Held-out round 1 (`holdout/`, `multi/holdout-*`)", cases: 26, written: "after the first engine was finished", precision: 94.1, recall: 88.9 },
+  { where: "Round 2 (`round2/`)", cases: 67, written: "adversarially, to find what round 1 missed", precision: 82.9, recall: 61.7 },
+  { where: "Round 3 (`round3/`, `multi/round3-*`)", cases: 48, written: "after the rewrite that round 2 prompted", precision: 91.3, recall: 77.8 },
+];
+
 const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
 
 export function toMarkdown(r: BenchmarkResult): string {
@@ -152,9 +164,19 @@ export function toMarkdown(r: BenchmarkResult): string {
     "",
     "## How to read this",
     "",
-    "The first 61 cases were written while the engine was being tuned, so they act as a regression baseline, not an independent score.",
+    "The corpus was written in four rounds. Each later round was run once, before anything was changed, and that first run is the only number here that says something about code the engine hasn't seen.",
     "",
-    "The 26 cases in `holdout/` and `multi/holdout-*` were written afterwards and run once before any changes. That first run scored **94.1% precision and 88.9% recall**: one false alarm (an imported helper named `execute` mistaken for a database call) and two misses (barrel re-exports, and HTML built inside a helper). All three were fixed in the engine, which is why they pass now.",
+    "| Round | Cases | Written | First run: precision / recall |",
+    "|---|---:|---|---:|",
+    ...ROUNDS.map((r) => `| ${r.where} | ${r.cases} | ${r.written} | ${r.precision === null ? "n/a" : `${r.precision}% / ${r.recall}%`} |`),
+    "",
+    "What each first run got wrong:",
+    "",
+    "- **Held-out round 1**: one false alarm (an imported helper named `execute` mistaken for a database call) and two misses (barrel re-exports, and HTML built inside a helper).",
+    "- **Round 2** was written to break the engine rather than to describe it, and it did: 18 misses and 6 false alarms. The analyser applied assignments in program order, so a value tainted in one branch and overwritten in the other came out clean; an HTML escaper cleared a value for SQL; NestJS decorators, Server Actions and Hono weren't sources; one tainted field made a whole object literal tainted. That led to a rewrite of the flow analysis (branch joins, context-aware sanitisers, per-field objects).",
+    "- **Round 3** checked the rewrite against patterns it hadn't been tuned on: 6 misses (calls into class-based services, `promisify(exec)`, GraphQL resolver arguments, a TypeORM `.where()` string, a `Location` header) and 2 false alarms (a Zod enum, and a redirect to a fixed path prefix).",
+    "",
+    "Every miss was fixed after it was recorded, which is why the table at the top shows no misses now. Read the first-run column, not the top table, as the estimate for new code: precision around 90%, recall around 80%.",
     "",
     "None of this is a comparison with other tools; for that you would need an external corpus such as the OWASP Benchmark.",
     ""

@@ -71,7 +71,7 @@ export function Landing() {
           ))}
         </dl>
         <p className="mt-2 text-right text-[11.5px] text-fg-3">
-          Benchmark is hand-written; the first run on unseen cases scored {bench.holdoutFirstRun.precision}% / {bench.holdoutFirstRun.recall}%.{" "}
+          Benchmark is hand-written; the latest round scored {bench.latestFirstRun.precision}% / {bench.latestFirstRun.recall}% on its first run, before its misses were fixed.{" "}
           <a className="underline decoration-line-strong underline-offset-2 hover:text-fg-2" href="https://github.com/Wali05/AegisCode/blob/main/bench/RESULTS.md">
             Details
           </a>
