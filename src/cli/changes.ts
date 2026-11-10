@@ -34,7 +34,41 @@ export function repoRoot(cwd: string): string {
   return root.trim();
 }
 
-const lines = (out: string | null) => (out ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+/** A changed file. `previous` is set when git detected a rename, so the old content can be found. */
+export interface Change {
+  path: string;
+  previous?: string;
+}
+
+/**
+ * Parses `git diff --name-status -z`. NUL-separated output is the only form in
+ * which git prints paths verbatim: the default quotes anything non-ASCII
+ * ("caf\303\251.js"), and such a file would then silently drop out of the scan.
+ */
+export function parseNameStatus(out: string | null): Change[] {
+  const parts = (out ?? "").split("\0");
+  const changes: Change[] = [];
+  for (let i = 0; i < parts.length; ) {
+    const status = parts[i++];
+    if (!status) continue;
+    if (/^[RC]/.test(status)) {
+      const from = parts[i++];
+      const to = parts[i++];
+      if (to) changes.push(status.startsWith("R") ? { path: to, previous: from } : { path: to });
+    } else if (parts[i]) changes.push({ path: parts[i++] });
+  }
+  return changes;
+}
+
+const DIFF = ["diff", "--name-status", "-z", "-M", "--diff-filter=ACMR"];
+const nulList = (out: string | null): Change[] => (out ?? "").split("\0").filter(Boolean).map((path) => ({ path }));
+
+/** Later lists win, but a rename recorded by an earlier one is kept. */
+function mergeChanges(...lists: Change[][]): Change[] {
+  const byPath = new Map<string, Change>();
+  for (const c of lists.flat()) byPath.set(c.path, { path: c.path, previous: c.previous ?? byPath.get(c.path)?.previous });
+  return [...byPath.values()];
+}
 
 interface Snapshot {
   label: string;
@@ -42,25 +76,24 @@ interface Snapshot {
 }
 
 /** Which files changed, and how to read each side of the change. */
-function describe(root: string, mode: ChangeMode): { paths: string[]; before: Snapshot; after: Snapshot } {
+function describe(root: string, mode: ChangeMode): { changes: Change[]; before: Snapshot; after: Snapshot } {
   const working: Snapshot = { label: "working tree", read: (p) => (existsSync(join(root, p)) ? readFileSync(join(root, p), "utf8") : null) };
   const atRev = (rev: string, label: string): Snapshot => ({ label, read: (p) => tryGit(root, ["show", `${rev}:${p}`]) });
   const hasHead = tryGit(root, ["rev-parse", "--verify", "HEAD"]) !== null;
   const head = hasHead ? atRev("HEAD", "HEAD") : { label: "empty repository", read: () => null };
 
   if (mode.kind === "staged") {
-    return { paths: lines(tryGit(root, ["diff", "--cached", "--name-only", "--diff-filter=ACMR"])), before: head, after: atRev("", "staged changes") };
+    return { changes: parseNameStatus(tryGit(root, [...DIFF, "--cached"])), before: head, after: atRev("", "staged changes") };
   }
+  const untracked = () => nulList(tryGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]));
   if (mode.kind === "working") {
-    const tracked = lines(tryGit(root, ["diff", "HEAD", "--name-only", "--diff-filter=ACMR"]));
-    const untracked = lines(tryGit(root, ["ls-files", "--others", "--exclude-standard"]));
-    return { paths: [...new Set([...tracked, ...untracked])], before: head, after: working };
+    return { changes: mergeChanges(parseNameStatus(tryGit(root, [...DIFF, "HEAD"])), untracked()), before: head, after: working };
   }
   const base = tryGit(root, ["merge-base", mode.ref, "HEAD"])?.trim();
-  if (!base) throw new Error(`Can't find a common ancestor with "${mode.ref}".`);
-  const committed = lines(tryGit(root, ["diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"]));
-  const uncommitted = lines(tryGit(root, ["diff", "HEAD", "--name-only", "--diff-filter=ACMR"]));
-  return { paths: [...new Set([...committed, ...uncommitted])], before: atRev(base, mode.ref), after: working };
+  if (!base) throw new Error(`Can't find a common ancestor with "${mode.ref}". Is the branch fetched?`);
+  // Compare the merge base with the working tree in one step, so a file renamed
+  // in one commit and edited in the next is still followed back to its old name.
+  return { changes: mergeChanges(parseNameStatus(tryGit(root, [...DIFF, base])), untracked()), before: atRev(base, mode.ref), after: working };
 }
 
 const JS_EXT = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
@@ -106,16 +139,18 @@ export interface ChangeScan extends Comparison {
 
 export async function scanChanges(cwd: string, mode: ChangeMode, opts: { packages?: boolean } = {}): Promise<ChangeScan> {
   const root = repoRoot(cwd);
-  const { paths, before, after } = describe(root, mode);
-  const relevant = paths.filter((p) => (detectLanguage(p) !== "unknown" && !/\.json$/i.test(p)) || isManifest(p)).slice(0, 400);
+  const { changes, before, after } = describe(root, mode);
+  const relevant = changes.filter((c) => (detectLanguage(c.path) !== "unknown" && !/\.json$/i.test(c.path)) || isManifest(c.path)).slice(0, 400);
 
-  const load = (snap: Snapshot) =>
-    relevant.flatMap((path) => {
-      const code = snap.read(path);
-      return code === null || code.length > 500_000 ? [] : [{ path, code }];
+  // A renamed file is read from its old path but filed under its new one, so
+  // the issues it already had are matched up instead of being reported as new.
+  const load = (snap: Snapshot, side: "before" | "after") =>
+    relevant.flatMap((c) => {
+      const code = snap.read(side === "before" ? (c.previous ?? c.path) : c.path);
+      return code === null || code.length > 500_000 ? [] : [{ path: c.path, code }];
     });
-  const beforeFiles = withImportedContext(load(before), before);
-  const afterFiles = withImportedContext(load(after), after);
+  const beforeFiles = withImportedContext(load(before, "before"), before);
+  const afterFiles = withImportedContext(load(after, "after"), after);
 
   const refsOf = (files: Array<{ path: string; code: string }>) => files.flatMap((f) => extractPackageRefs(f.path, f.code, detectLanguage(f.path, f.code)));
   const scan = (files: Array<{ path: string; code: string }>) => scanProject(files.filter((f) => !/\.json$/.test(f.path) || isManifest(f.path))).flatMap((r) => r.findings);
@@ -129,5 +164,5 @@ export async function scanChanges(cwd: string, mode: ChangeMode, opts: { package
     if (fresh.length) headFindings.push(...(await checkPackages(fresh)).findings);
   }
 
-  return { files: relevant, baseLabel: before.label, headLabel: after.label, ...diffFindings(baseFindings, headFindings) };
+  return { files: relevant.map((c) => c.path), baseLabel: before.label, headLabel: after.label, ...diffFindings(baseFindings, headFindings) };
 }

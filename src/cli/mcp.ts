@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -36,10 +36,20 @@ export function formatForAgent(findings: Finding[], heading: string): string {
 
 const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
 
-/** Resolves a user-supplied path and refuses anything outside the project root. */
-function insideRoot(root: string, p: string): string {
-  const abs = resolve(root, p);
-  if (abs !== root && !abs.startsWith(root + sep)) throw new Error(`${p} is outside the project`);
+/**
+ * Resolves a user-supplied path and refuses anything outside the project root.
+ * The check runs on the real path, so a symlink inside the project can't be
+ * used to read files elsewhere on the machine.
+ */
+export function insideRoot(root: string, p: string): string {
+  const base = realpathSync(root);
+  let abs = resolve(base, p);
+  try {
+    abs = realpathSync(abs);
+  } catch {
+    throw new Error(`${p} does not exist`);
+  }
+  if (abs !== base && !abs.startsWith(base + sep)) throw new Error(`${p} is outside the project`);
   return abs;
 }
 
@@ -94,15 +104,23 @@ export function createServer(root = process.cwd()): McpServer {
     },
     async ({ paths }) => {
       const files: Array<{ path: string; code: string }> = [];
-      const walk = (abs: string) => {
-        const st = statSync(abs);
+      const base = realpathSync(root);
+      const walk = (abs: string, top: boolean) => {
+        let st;
+        try {
+          // Links below the requested path are skipped: they may loop, dangle or leave the project.
+          if (!top && lstatSync(abs).isSymbolicLink()) return;
+          st = statSync(abs);
+        } catch {
+          return;
+        }
         if (st.isDirectory()) {
-          for (const name of readdirSync(abs)) if (!name.startsWith(".") && name !== "node_modules") walk(resolve(abs, name));
+          for (const name of readdirSync(abs)) if (!name.startsWith(".") && name !== "node_modules") walk(resolve(abs, name), false);
         } else if (st.isFile() && st.size < 500_000 && detectLanguage(abs) !== "unknown" && files.length < 400) {
-          files.push({ path: relative(root, abs), code: readFileSync(abs, "utf8") });
+          files.push({ path: relative(base, abs).split(sep).join("/"), code: readFileSync(abs, "utf8") });
         }
       };
-      for (const p of paths) walk(insideRoot(root, p));
+      for (const p of paths) walk(insideRoot(root, p), true);
       const findings = scanProject(files).flatMap((r) => r.findings);
       return text(formatForAgent(findings, `AegisCode: scanned ${files.length} file(s).`));
     }

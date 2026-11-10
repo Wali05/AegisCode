@@ -1,12 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, appendFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../src/cli/mcp";
-import { scanChanges } from "../src/cli/changes";
+import { parseNameStatus, scanChanges } from "../src/cli/changes";
+import { walk } from "../src/cli/index";
 import { diffFindings } from "../src/lib/baseline";
 import { scanFile } from "../src/lib/engine";
 
@@ -55,6 +56,51 @@ describe("change scanning", () => {
     expect(res.added.map((f) => f.ruleId)).toEqual(["AEG-TAINT-CODE"]);
     git("reset", "-q", "--hard");
   });
+
+  it("follows a renamed file back to its old name, so its existing issues aren't reported as new", async () => {
+    git("mv", "src/db.ts", "src/database.ts");
+    const moved = await scanChanges(repo, { kind: "staged" }, { packages: false });
+    expect(moved.files).toEqual(["src/database.ts"]);
+    expect(moved.added).toEqual([]);
+    expect(moved.existing.length).toBeGreaterThan(0);
+
+    appendFileSync(join(repo, "src/database.ts"), `app.get("/e", (req) => eval(req.query.x));\n`);
+    git("add", "-A");
+    const edited = await scanChanges(repo, { kind: "staged" }, { packages: false });
+    expect(edited.added.map((f) => [f.ruleId, f.file])).toEqual([["AEG-TAINT-CODE", "src/database.ts"]]);
+    git("reset", "-q", "--hard");
+  });
+
+  it("scans files whose names git would otherwise quote", async () => {
+    const name = "src/café ünï.ts";
+    writeFileSync(join(repo, name), `app.get("/", (req) => eval(req.query.x));\n`);
+    const untracked = await scanChanges(repo, { kind: "working" }, { packages: false });
+    expect(untracked.files).toEqual([name]);
+    expect(untracked.added.map((f) => f.ruleId)).toEqual(["AEG-TAINT-CODE"]);
+
+    git("add", "-A");
+    const staged = await scanChanges(repo, { kind: "staged" }, { packages: false });
+    expect(staged.added.map((f) => f.file)).toEqual([name]);
+    git("reset", "-q", "--hard");
+  });
+
+  it("parses NUL-separated name-status output, including renames", () => {
+    expect(parseNameStatus("M\0a.ts\0R087\0old name.ts\0new name.ts\0A\0b.ts\0")).toEqual([{ path: "a.ts" }, { path: "new name.ts", previous: "old name.ts" }, { path: "b.ts" }]);
+    expect(parseNameStatus(null)).toEqual([]);
+  });
+});
+
+describe("file walk", () => {
+  it("skips dangling links and link loops instead of aborting", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aegis-walk-"));
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "src/a.ts"), "export const a = 1;\n");
+    symlinkSync("/nonexistent/target", join(dir, "src/dangling"));
+    symlinkSync(dir, join(dir, "src/loop"));
+    symlinkSync(join(dir, "src/a.ts"), join(dir, "alias.ts"));
+    expect(walk(dir).map((e) => e.path).sort()).toEqual(["alias.ts", "src/a.ts"]);
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe("MCP server", () => {
@@ -84,6 +130,11 @@ describe("MCP server", () => {
     const client = await connect();
     const outside = await client.callTool({ name: "scan_paths", arguments: { paths: ["../../etc"] } });
     expect(JSON.stringify(outside)).toMatch(/outside the project/);
+    // A link inside the project must not become a way to read files outside it.
+    symlinkSync(tmpdir(), join(repo, "escape"));
+    const viaLink = await client.callTool({ name: "scan_paths", arguments: { paths: ["escape"] } });
+    expect(JSON.stringify(viaLink)).toMatch(/outside the project/);
+    rmSync(join(repo, "escape"));
     expect(textOf(await client.callTool({ name: "explain_rule", arguments: { id: "aeg-taint-sql" } }))).toMatch(/^AEG-TAINT-SQL — SQL injection/);
   });
 

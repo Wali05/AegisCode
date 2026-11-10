@@ -1,5 +1,5 @@
-import { chmodSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { applyEdits, scanFile, scanProject } from "../lib/engine";
 import type { Finding, Severity } from "../lib/engine/types";
 import { SEVERITIES } from "../lib/engine/types";
@@ -92,20 +92,56 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function walk(root: string): TreeEntry[] {
+/**
+ * Lists the files under `root`. Symbolic links to directories are not followed
+ * (they can point back up the tree), and anything that can't be read — a
+ * dangling link, a directory without permission — is skipped rather than
+ * aborting the whole scan.
+ */
+export function walk(root: string): TreeEntry[] {
   const out: TreeEntry[] = [];
   const visit = (dir: string) => {
-    for (const name of readdirSync(dir)) {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
       if (name.startsWith(".") || name === "node_modules") continue;
       const full = join(dir, name);
-      const st = statSync(full);
-      if (st.isDirectory()) visit(full);
-      else if (st.isFile()) out.push({ path: relative(root, full).split("\\").join("/"), size: st.size, sha: "" });
+      try {
+        const link = lstatSync(full);
+        const st = link.isSymbolicLink() ? statSync(full) : link;
+        if (st.isDirectory()) {
+          if (!link.isSymbolicLink()) visit(full);
+        } else if (st.isFile()) out.push({ path: relative(root, full).split("\\").join("/"), size: st.size, sha: "" });
+      } catch {
+        // dangling symlink or unreadable entry
+      }
     }
   };
-  if (statSync(root).isFile()) return [{ path: root.split("/").pop()!, size: statSync(root).size, sha: "" }];
+  if (statSync(root).isFile()) return [{ path: basename(root), size: statSync(root).size, sha: "" }];
   visit(root);
   return out;
+}
+
+/** Writes a report file, creating its folder if needed. */
+function writeReport(path: string, content: string) {
+  mkdirSync(dirname(resolve(path)), { recursive: true });
+  writeFileSync(path, content);
+}
+
+function readBaseline(path: string): BaselineFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(`Can't read baseline ${path}: ${err instanceof Error ? err.message : err}`);
+  }
+  const base = parsed as Partial<BaselineFile>;
+  if (!base || !Array.isArray(base.findings)) throw new Error(`${path} is not an AegisCode baseline (run \`aegis scan --write-baseline ${path}\` to create one).`);
+  return { version: 1, createdAt: typeof base.createdAt === "string" ? base.createdAt : "", findings: base.findings };
 }
 
 function printFinding(f: Finding, tag = "") {
@@ -182,6 +218,7 @@ export async function main(argv: string[]): Promise<number> {
 
   for (const p of args.paths) {
     const root = resolve(p);
+    if (!existsSync(root)) throw new Error(`No such file or directory: ${p}`);
     const isFile = statSync(root).isFile();
     const base = isFile ? resolve(root, "..") : root;
     const entries = walk(root);
@@ -230,13 +267,13 @@ export async function main(argv: string[]): Promise<number> {
   // With a baseline, only findings that aren't in it are reported and can fail the run.
   let reported = open;
   if (args.baseline) {
-    const base = JSON.parse(readFileSync(args.baseline, "utf8")) as BaselineFile;
+    const base = readBaseline(args.baseline);
     const diff = diffFindings(base.findings.map((b) => ({ ...b, status: "open" }) as Finding), open);
     reported = diff.added;
-    console.log(c.dim(`baseline: ${diff.added.length} new · ${diff.existing.length} known · ${diff.fixed.length} fixed since ${base.createdAt.slice(0, 10)}`));
+    console.log(c.dim(`baseline: ${diff.added.length} new · ${diff.existing.length} known · ${diff.fixed.length} fixed${base.createdAt ? ` since ${base.createdAt.slice(0, 10)}` : ""}`));
   }
   if (args.writeBaseline) {
-    writeFileSync(args.writeBaseline, JSON.stringify(toBaseline(open), null, 2));
+    writeReport(args.writeBaseline, JSON.stringify(toBaseline(open), null, 2));
     console.log(c.dim(`baseline: wrote ${open.length} findings to ${args.writeBaseline}`));
   }
 
@@ -250,11 +287,11 @@ export async function main(argv: string[]): Promise<number> {
   const suppressed = findings.length - open.length;
   console.log(`${c.lime("aegis")} ${files} files · ${loc.toLocaleString()} lines · score ${c.bold(String(score))} (${gradeFor(score)}) · ${counts}${suppressed ? c.dim(` · ${suppressed} suppressed`) : ""} · ${Math.round(performance.now() - t0)} ms`);
 
-  if (args.sarif) writeFileSync(args.sarif, JSON.stringify(toSarif(report), null, 2));
-  if (args.json) writeFileSync(args.json, JSON.stringify(report, null, 2));
+  if (args.sarif) writeReport(args.sarif, JSON.stringify(toSarif(report), null, 2));
+  if (args.json) writeReport(args.json, JSON.stringify(report, null, 2));
   if (args.md) {
     const counted = Object.fromEntries(SEVERITIES.map((s) => [s, open.filter((f) => f.severity === s).length])) as Record<Severity, number>;
-    writeFileSync(
+    writeReport(
       args.md,
       toMarkdown({
         id: "cli",
@@ -289,8 +326,8 @@ async function scanChangeSet(args: Args): Promise<number> {
     `${c.lime("aegis")} ${res.files.length} changed file${res.files.length === 1 ? "" : "s"} (${res.headLabel} vs ${res.baseLabel}) · ${c.bold(String(res.added.length))} new: ${sev} · ${c.lime(String(res.fixed.length))} fixed · ${res.existing.length} pre-existing · ${Math.round(performance.now() - t0)} ms`
   );
   const report = { findings: res.added, engine: { version: ENGINE_VERSION, rules: RULE_COUNT } };
-  if (args.sarif) writeFileSync(args.sarif, JSON.stringify(toSarif(report), null, 2));
-  if (args.json) writeFileSync(args.json, JSON.stringify({ ...report, fixed: res.fixed, existing: res.existing }, null, 2));
+  if (args.sarif) writeReport(args.sarif, JSON.stringify(toSarif(report), null, 2));
+  if (args.json) writeReport(args.json, JSON.stringify({ ...report, fixed: res.fixed, existing: res.existing }, null, 2));
   return blockingExit(res.added, args.failOn, "new ");
 }
 
