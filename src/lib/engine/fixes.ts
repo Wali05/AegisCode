@@ -81,6 +81,27 @@ function pieces(sf: ts.SourceFile, e: ts.Expression): Array<{ lit: string } | { 
 
 // ─── fixers ──────────────────────────────────────────────────────────────────
 
+/**
+ * True when the SQL written so far ends where a single value is expected:
+ * after a comparison, LIKE, LIMIT / OFFSET, BETWEEN … AND, or inside the
+ * parentheses of VALUES (…) / IN (…).
+ */
+export function isValuePosition(sql: string): boolean {
+  const t = sql.trimEnd();
+  if (/(?:=|<|>)$/.test(t)) return true;
+  if (/\b(?:LIKE|ILIKE|LIMIT|OFFSET|BETWEEN)$/i.test(t)) return true;
+  if (/\bBETWEEN\s+\S+\s+AND$/i.test(t)) return true;
+  if (/[(,]$/.test(t)) {
+    // Find the parenthesis this position is inside and look at the keyword in front of it.
+    let depth = 0;
+    for (let i = t.length - 1; i >= 0; i--) {
+      if (t[i] === ")") depth++;
+      else if (t[i] === "(" && depth-- === 0) return /\b(?:VALUES|IN)\s*$/i.test(t.slice(0, i));
+    }
+  }
+  return false;
+}
+
 /** "SELECT … '" + x + "'" → "SELECT … $1", [x] */
 const parameteriseSql: Fixer = ({ sf, node }) => {
   if (!ts.isCallExpression(node) || node.arguments.length !== 1) return null;
@@ -89,7 +110,12 @@ const parameteriseSql: Fixer = ({ sf, node }) => {
   // Only rewrite when the SQL text is right here; a query built elsewhere needs a fix where it's built.
   if (!parts.some((p) => "lit" in p && /\b(?:SELECT|INSERT|UPDATE|DELETE|WHERE|VALUES|SET)\b/i.test(p.lit))) return null;
   const callee = text(sf, node.expression);
+  // prepare() and exec() take the SQL only (values go to a later .get() / .run()), and Prisma's
+  // *Unsafe calls take values as separate arguments: a `, [values]` rewrite would be wrong for all of them.
+  if (/\.(?:prepare|exec|\$queryRawUnsafe|\$executeRawUnsafe)$/.test(callee)) return null;
   const dollar = /pool|pg|postgres|client|sql\b|neon|supabase/i.test(callee);
+  // Sequelize passes values through an options object, not a second positional array.
+  const sequelize = /sequelize\.query$/i.test(callee);
   let sql = "";
   const params: string[] = [];
   for (let i = 0; i < parts.length; i++) {
@@ -109,16 +135,24 @@ const parameteriseSql: Fixer = ({ sf, node }) => {
       sql = sql.slice(0, -m[0].length);
       if (next && "lit" in next) next.lit = next.lit.slice(m[2].length + 1);
       if (m[2]) value = `\`%\${${value}}%\``;
-    } else if (m && m[2] === "" && /^%/.test(after)) {
+    } else if (m) {
+      // A quote opens here but doesn't close right after the value: not a shape that can be rewritten mechanically.
+      return null;
+    } else if (/\bIN\s*\(\s*$/i.test(sql) && /^\s*\)/.test(after)) {
+      // IN (${ids}): one expression standing in for a whole list can't become one bound value.
+      return null;
+    } else if (!isValuePosition(sql)) {
+      // Only a value can be bound. A spliced-in clause ("… FROM posts " + where), a column or a sort
+      // direction would turn into a broken query, so there is no automatic fix for those.
       return null;
     }
     params.push(value);
-    sql += dollar ? `$${params.length}` : "?";
+    sql += dollar && !sequelize ? `$${params.length}` : "?";
   }
   return {
     title: "Use a parameterised query",
-    explanation: `Values are sent separately from the SQL text (${dollar ? "$1, $2 …" : "? placeholders"}), so they can never change the query's structure.`,
-    edits: [{ start: node.arguments[0].getStart(sf), end: node.arguments[0].getEnd(), text: `${JSON.stringify(sql)}, [${params.join(", ")}]` }],
+    explanation: `Values are sent separately from the SQL text (${dollar && !sequelize ? "$1, $2 …" : "? placeholders"}), so they can never change the query's structure.`,
+    edits: [{ start: node.arguments[0].getStart(sf), end: node.arguments[0].getEnd(), text: `${JSON.stringify(sql)}, ${sequelize ? `{ replacements: [${params.join(", ")}] }` : `[${params.join(", ")}]`}` }],
   };
 };
 
@@ -127,6 +161,8 @@ const useTextContent: Fixer = ({ sf, node }) => {
   if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return null;
   const left = node.left;
   if (!ts.isPropertyAccessExpression(left) || !/^(?:innerHTML|outerHTML)$/.test(left.name.text)) return null;
+  // If the string contains markup on purpose, textContent would print the tags; that needs a sanitiser, not this edit.
+  if ((pieces(sf, node.right) ?? []).some((p) => "lit" in p && /<\/?[a-z]/i.test(p.lit))) return null;
   return {
     title: "Write text instead of HTML",
     explanation: "textContent inserts the value as plain text, so markup in it is displayed rather than executed. If you really need HTML, sanitise it with DOMPurify first.",

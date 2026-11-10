@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { scanProject } from "../src/lib/engine";
+import { isValuePosition } from "../src/lib/engine/fixes";
 import { taint } from "./helpers";
 
 const fixesFor = (code: string, file = "a.ts") => {
@@ -31,6 +32,40 @@ describe("verified quick fixes", () => {
   it("uses ? placeholders for non-postgres clients and refuses identifiers", () => {
     expect(fixesFor(`app.get("/", (req) => db.query(\`SELECT * FROM t WHERE id = \${req.query.id}\`));`)[0].added).toContain(`db.query("SELECT * FROM t WHERE id = ?", [req.query.id])`);
     expect(fixesFor(`app.get("/", (req) => db.query("SELECT * FROM t ORDER BY " + req.query.col));`)).toEqual([]);
+  });
+
+  it("only binds values, never a spliced-in clause, column or sort direction", () => {
+    // Binding `where` or `dir` as a parameter would produce a query that no longer runs.
+    expect(fixesFor(`app.get("/", async (req, res) => {\n  const where = req.query.q ? "WHERE title = '" + req.query.q + "'" : "";\n  const dir = req.query.dir;\n  res.json(await db.query("SELECT * FROM posts " + where + " ORDER BY created_at " + dir));\n});`)).toEqual([]);
+    expect(fixesFor(`app.get("/", (req) => db.query("SELECT " + req.query.cols + " FROM t WHERE id = 1"));`)).toEqual([]);
+    expect(fixesFor(`app.get("/", (req) => db.query("SELECT * FROM t WHERE name = '" + req.query.n + " AND x = 1"));`)).toEqual([]);
+    expect(isValuePosition("SELECT * FROM t WHERE id = ")).toBe(true);
+    expect(isValuePosition("SELECT * FROM t WHERE age >= ")).toBe(true);
+    expect(isValuePosition("SELECT * FROM t WHERE id IN (?, ")).toBe(true);
+    expect(isValuePosition("INSERT INTO t (a, b) VALUES (")).toBe(true);
+    expect(isValuePosition("SELECT * FROM t WHERE d BETWEEN ? AND ")).toBe(true);
+    expect(isValuePosition("SELECT * FROM t LIMIT ")).toBe(true);
+    expect(isValuePosition("SELECT * FROM posts ")).toBe(false);
+    expect(isValuePosition("SELECT * FROM t WHERE a = 1 AND ")).toBe(false);
+    expect(isValuePosition("SELECT count(")).toBe(false);
+    expect(isValuePosition("SELECT * FROM t ORDER BY created_at ")).toBe(false);
+  });
+
+  it("binds every value in VALUES and IN lists", () => {
+    expect(fixesFor(`app.post("/", (req) => db.query("INSERT INTO t (a, b) VALUES (" + req.body.a + ", '" + req.body.b + "')"));`)[0].added).toContain(`db.query("INSERT INTO t (a, b) VALUES (?, ?)", [req.body.a, req.body.b])`);
+    expect(fixesFor(`app.get("/", (req) => pool.query("SELECT * FROM t WHERE id IN (" + req.query.a + ", " + req.query.b + ") LIMIT " + req.query.n));`)[0].added).toContain(`pool.query("SELECT * FROM t WHERE id IN ($1, $2) LIMIT $3", [req.query.a, req.query.b, req.query.n])`);
+  });
+
+  it("writes the fix in the form each client expects, or not at all", () => {
+    expect(fixesFor("app.get('/', async (req, res) => res.json(await sequelize.query(`SELECT * FROM p WHERE name = '${req.query.n}'`)));")[0].added).toContain(`sequelize.query("SELECT * FROM p WHERE name = ?", { replacements: [req.query.n] })`);
+    expect(fixesFor(`app.get("/", (req, res) => res.json(db.prepare("SELECT * FROM t WHERE id = " + req.query.id).get()));`)).toEqual([]);
+    expect(fixesFor("app.get('/', async (req, res) => res.json(await prisma.$queryRawUnsafe(`SELECT * FROM t WHERE id = ${req.query.id}`)));")).toEqual([]);
+    expect(fixesFor("app.post('/', (req) => { const ids = req.body.ids.join(','); db.query(`DELETE FROM t WHERE id IN (${ids})`); });")).toEqual([]);
+  });
+
+  it("does not turn intentional markup into text", () => {
+    expect(fixesFor(`el.innerHTML = "<strong>" + location.hash + "</strong>";`, "c.js")).toEqual([]);
+    expect(fixesFor(`el.innerHTML = "Welcome " + location.hash;`, "c.js")[0].added).toContain("el.textContent =");
   });
 
   it("does not rewrite queries that are built somewhere else", () => {
