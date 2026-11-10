@@ -101,9 +101,13 @@ export class ProjectIndex {
           const theirs = target ? this.exports.get(target) : undefined;
           if (!theirs) continue;
           if (!re.names) {
-            for (const [k, v] of theirs) if (k !== "default" && !own.has(k)) own.set(k, v);
+            for (const [k, v] of theirs) if (k !== "default" && !k.startsWith("default.") && !own.has(k)) own.set(k, v);
           } else {
-            for (const [exported, imported] of re.names) if (theirs.has(imported)) own.set(exported, theirs.get(imported)!);
+            for (const [exported, imported] of re.names) {
+              if (theirs.has(imported)) own.set(exported, theirs.get(imported)!);
+              // A re-exported class brings its methods (`Class.method`) with it.
+              for (const [k, v] of theirs) if (k.startsWith(`${imported}.`)) own.set(`${exported}${k.slice(imported.length)}`, v);
+            }
           }
         }
         this.exports.set(path, own);
@@ -143,6 +147,12 @@ export class ProjectIndex {
       else {
         const summary = exported.get(imp.imported);
         if (summary) map.set(imp.local, { kind: "fn", summary });
+        else {
+          // An imported class: its methods, for calls on `new Local()` or anything declared as `Local`.
+          const prefix = `${imp.imported}.`;
+          const members = new Map([...exported].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => [k.slice(prefix.length), v]));
+          if (members.size) map.set(imp.local, { kind: "ns", members });
+        }
       }
     }
     return map;

@@ -253,6 +253,8 @@ export class TaintAnalyzer {
   private summaryKeys = new Set<string>();
   /** The module starts with a "use server" directive, so its exports are callable by any client. */
   private useServerFile: boolean;
+  /** What the file's declarations say about names: classes, instance types, renamed callees, Zod schemas. */
+  private facts: FileFacts;
 
   constructor(
     private sf: ts.SourceFile,
@@ -260,6 +262,7 @@ export class TaintAnalyzer {
     private imports: ImportMap = new Map()
   ) {
     this.useServerFile = hasDirective(sf.statements, "use server");
+    this.facts = collectFacts(sf);
   }
 
   run(): Finding[] {
@@ -290,16 +293,22 @@ export class TaintAnalyzer {
   exportSummaries(): Map<string, ExportedSummary> {
     this.buildSummaries();
     const out = new Map<string, ExportedSummary>();
-    for (const [exported, local] of exportedFunctionNames(this.sf)) {
-      const summary = this.summaries.get(local);
-      if (!summary) continue;
-      out.set(exported, {
-        name: exported === "default" ? local : exported,
+    const publish = (key: string, name: string, summary: FunctionSummary) =>
+      out.set(key, {
+        name,
         file: this.file,
         returns: [...summary.returns],
         returnsMarkup: [...summary.returnsMarkup],
         sinks: summary.sinks.map((h) => ({ ...h, steps: h.steps.map((st) => (st.file ? st : { ...st, file: this.file })) })),
       });
+    for (const [exported, local] of exportedFunctionNames(this.sf)) {
+      const summary = this.summaries.get(local);
+      if (summary) publish(exported, exported === "default" ? local : exported, summary);
+      // An exported class publishes its methods as `Class.method`, for `new Class().method(x)` in importers.
+      if (!this.facts.classes.has(local)) continue;
+      for (const [key, method] of this.summaries) {
+        if (key.startsWith(`${local}#`)) publish(`${exported}.${key.slice(local.length + 1)}`, `${local}.${key.slice(local.length + 1)}`, method);
+      }
     }
     return out;
   }
@@ -413,7 +422,7 @@ export class TaintAnalyzer {
       if (ts.isFunctionDeclaration(node) && node.name && node.body) out.set(node.name.text, node);
       else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) {
         out.set(node.name.text, node.initializer);
-      } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name) && node.body) out.set(`this.${node.name.text}`, node);
+      } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name) && node.body) out.set(`${classContext(node) ?? ""}#${node.name.text}`, node);
       ts.forEachChild(node, visit);
     };
     visit(this.sf);
@@ -421,12 +430,12 @@ export class TaintAnalyzer {
   }
 
   private summarise(name: string, fn: FunctionLike) {
-    const summary: FunctionSummary = { name, returns: new Set(), returnsMarkup: new Set(), sinks: [] };
+    const summary: FunctionSummary = { name: name.replace(/^#/, "").replace("#", "."), returns: new Set(), returnsMarkup: new Set(), sinks: [] };
     const scope = new Scope(undefined, false, true);
     fn.parameters.forEach((p, index) => {
       const taint: Taint = {
         origin: { kind: "param", index },
-        steps: [this.step("propagation", p, `enters ${name}() as parameter ${index + 1}`)],
+        steps: [this.step("propagation", p, `enters ${name.replace(/^#/, "").replace("#", ".")}() as parameter ${index + 1}`)],
         confidence: 1,
         structured: true,
       };
@@ -529,6 +538,8 @@ export class TaintAnalyzer {
     if (!taint) return;
     if (taint.neutralised?.has(sink.id)) return;
     if (sink.id === "AEG-TAINT-NOSQL" && !taint.structured) return;
+    // "/users/" + id can only ever be a path on this site.
+    if (sink.id === "AEG-TAINT-REDIRECT" && hasLocalPathPrefix(argNode)) return;
     let severityOverride: SinkSpec["severity"] | undefined;
     let note: string | undefined = why;
     let factor = 1;
@@ -879,6 +890,7 @@ export class TaintAnalyzer {
     const declared = name && ts.isIdentifier(name) ? name.text : ts.isVariableDeclaration(fn.parent) && ts.isIdentifier(fn.parent.name) ? fn.parent.name.text : "";
     const isHandler = HTTP_HANDLER_NAMES.test(declared) || this.isRouterCallback(fn);
     const serverAction = this.isServerAction(fn);
+    const resolver = isGraphqlResolver(fn);
 
     fn.parameters.forEach((p, i) => {
       if (i === seedIndex && seed) {
@@ -887,6 +899,12 @@ export class TaintAnalyzer {
       }
       const type = p.type ? this.text(p.type) : "";
       const primitive = /^(?:number|boolean|bigint|Date)\b/.test(type);
+      // GraphQL resolvers are called as (parent, args, context, info); `args` is whatever the client sent.
+      if (resolver && i === 1) {
+        const t: Taint = { origin: { kind: "source" }, steps: [this.step("source", p, "GraphQL arguments")], confidence: 0.85, structured: true };
+        this.bindPattern(p.name, t, scope);
+        return;
+      }
       if (isHandler && ts.isObjectBindingPattern(p.name)) {
         for (const el of p.name.elements) {
           const key = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : ts.isIdentifier(el.name) ? el.name.text : "";
@@ -987,7 +1005,8 @@ export class TaintAnalyzer {
       const targetText = this.calleeText(target);
       if (value) {
         for (const { target: re, sink } of ASSIGNMENT_SINKS) {
-          if (re.test(targetText)) this.checkSink(sink, value, target, target.parent ?? target);
+          const rhs = target.parent && ts.isBinaryExpression(target.parent) ? target.parent.right : target;
+          if (re.test(targetText)) this.checkSink(sink, value, rhs, target.parent ?? target);
         }
       }
       // obj[userKey] = value  → prototype pollution when the key is attacker-controlled.
@@ -1182,11 +1201,14 @@ export class TaintAnalyzer {
       return t ? this.extend(t, this.step("propagation", node, `wrapped in ${callee}`)) : null;
     }
     if (/^Response$/.test(callee) && args[0]) this.checkReflected(args[0], argTaints[0], node);
+    if (/^(?:Next)?Response$/.test(callee) && args[1]) this.checkLocation(headerValue(args[1], "headers"), node, scope);
     return null;
   }
 
   private evalCall(node: ts.CallExpression, scope: Scope): Taint | null {
-    const callee = this.calleeText(node.expression);
+    const written = this.calleeText(node.expression);
+    // `const execAsync = promisify(exec)` and `import { exec as run }` are the same function under another name.
+    const callee = (ts.isIdentifier(node.expression) && this.facts.renamed.get(written)) || written;
     const args = node.arguments;
 
     // Receiver taint for method calls (`input.trim()`, `searchParams.get()`).
@@ -1211,12 +1233,16 @@ export class TaintAnalyzer {
     });
 
     // Function summaries: local functions first, then functions imported from other project files.
-    const local = this.summaries.get(callee) ?? (ts.isIdentifier(node.expression) ? this.summaries.get(node.expression.text) : undefined);
+    const local = this.localSummary(node.expression, written);
     const external = local ? undefined : this.externalSummary(node.expression);
     const summary = local ?? external;
 
-    if (!summary) this.checkShellSpawn(callee, node, scope);
-    if (!summary) this.checkWhere(callee, node, scope);
+    if (!summary) {
+      this.checkShellSpawn(callee, node, scope);
+      this.checkWhere(callee, node, scope);
+      this.checkQueryBuilder(callee, node, argTaints[0] ?? null);
+      this.checkLocation(this.locationHeader(callee, node), node, scope);
+    }
 
     // Sinks — skipped for calls into the project's own code (a helper named `execute` is not a DB driver).
     for (const sink of summary ? [] : SINKS) {
@@ -1253,6 +1279,17 @@ export class TaintAnalyzer {
 
     const source = this.sourceFromCall(callee, node, scope);
     if (source) return source;
+
+    // Schema.parse(input): the result has the shape the schema allows, not the shape the client sent.
+    if (/^(?:parse|parseAsync|safeParse|safeParseAsync)$/.test(method) && ts.isPropertyAccessExpression(node.expression)) {
+      const shape = schemaShape(node.expression.expression, this.facts.schemas);
+      if (shape) {
+        const input = argTaints[0] ? this.extend({ ...argTaints[0], structured: false, fields: undefined }, this.step("propagation", node, `validated by ${written}()`)) : null;
+        const parsed = applyShape(shape, input);
+        if (!parsed || !method.startsWith("safeParse")) return parsed;
+        return { ...parsed, fields: new Map<string, Taint | null>([["data", parsed], ["success", null], ["error", null]]) };
+      }
+    }
 
     const everything = argTaints.reduce<Taint | null>((acc, t) => this.union(acc, t), receiver);
     const cleans = sanitizerScope(callee);
@@ -1351,7 +1388,65 @@ export class TaintAnalyzer {
       const b = this.imports.get(expr.expression.text);
       if (b?.kind === "ns") return b.members.get(expr.name.text);
     }
+    // users.findByName(...) where `users` is an instance of an imported class.
+    if (ts.isPropertyAccessExpression(expr)) {
+      const cls = this.classOf(expr.expression);
+      const b = cls ? this.imports.get(cls) : undefined;
+      if (b?.kind === "ns") return b.members.get(expr.name.text);
+    }
     return undefined;
+  }
+
+  /** A function, `exports.fn`, or a method of a class declared in this file. */
+  private localSummary(expr: ts.Expression, callee: string): FunctionSummary | undefined {
+    if (ts.isIdentifier(expr)) return this.summaries.get(expr.text);
+    const direct = this.summaries.get(callee);
+    if (direct) return direct;
+    if (!ts.isPropertyAccessExpression(expr)) return undefined;
+    const cls = this.classOf(expr.expression);
+    return cls === null ? undefined : this.summaries.get(`${cls}#${expr.name.text}`);
+  }
+
+  /**
+   * The class an expression is an instance of, when the code says so: `this`,
+   * `new C()`, a variable or parameter declared as `C`, or a field declared as
+   * `C` (including constructor parameter properties, the usual way services
+   * are injected).
+   */
+  private classOf(expr: ts.Expression): string | null {
+    let e = expr;
+    while (ts.isParenthesizedExpression(e) || ts.isAwaitExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+    if (e.kind === ts.SyntaxKind.ThisKeyword) return classContext(e);
+    if (ts.isNewExpression(e) && ts.isIdentifier(e.expression)) return e.expression.text;
+    if (ts.isIdentifier(e)) return this.facts.classes.has(e.text) ? e.text : (this.facts.instances.get(e.text) ?? null);
+    if (ts.isPropertyAccessExpression(e) && e.expression.kind === ts.SyntaxKind.ThisKeyword) return this.facts.fields.get(`${classContext(e) ?? ""}#${e.name.text}`) ?? null;
+    return null;
+  }
+
+  /** `.where("name = '" + x + "'")` on a query builder is raw SQL; `.where("name", x)` and `.where({ name: x })` are not. */
+  private checkQueryBuilder(callee: string, node: ts.CallExpression, taint: Taint | null) {
+    if (!taint || !/\.(?:where|andWhere|orWhere|having|andHaving|orHaving)$/.test(callee)) return;
+    const first = node.arguments[0];
+    const built = ts.isTemplateExpression(first) || (ts.isBinaryExpression(first) && first.operatorToken.kind === ts.SyntaxKind.PlusToken);
+    if (!built) return;
+    const sink = SINKS.find((s) => s.id === "AEG-TAINT-SQL")!;
+    this.checkSink({ ...sink, title: "SQL injection in a query-builder condition", confidence: 0.8 }, taint, first, node);
+  }
+
+  /** The expression used as a `Location` header by `res.writeHead`, `res.setHeader` and friends. */
+  private locationHeader(callee: string, node: ts.CallExpression): ts.Expression | undefined {
+    const m = /^(?:res|reply|response|ctx)\.(writeHead|setHeader|header|set|append|location)$/.exec(callee);
+    if (!m) return undefined;
+    const args = node.arguments;
+    if (m[1] === "location") return args[0];
+    if (m[1] === "writeHead") return args.map((a) => headerValue(a)).find(Boolean);
+    return args[0] && ts.isStringLiteralLike(args[0]) && /^location$/i.test(args[0].text) ? args[1] : undefined;
+  }
+
+  private checkLocation(target: ts.Expression | undefined, node: ts.Node, scope: Scope) {
+    if (!target) return;
+    const sink = SINKS.find((s) => s.id === "AEG-TAINT-REDIRECT")!;
+    this.checkSink(sink, this.evalExpr(target, scope), target, node, "sent as the Location header");
   }
 
   /** Reflected XSS: tainted data concatenated into an HTML string sent as a response. */
@@ -1388,6 +1483,159 @@ function baseName(expr: ts.Expression): string | null {
   let e = expr;
   while (ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e) || ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e) || ts.isAsExpression(e)) e = e.expression;
   return ts.isIdentifier(e) ? e.text : null;
+}
+
+/** The class (or object literal, as "") whose `this` is in effect at `node`; null outside any. */
+function classContext(node: ts.Node): string | null {
+  for (let n: ts.Node | undefined = node.parent; n; n = n.parent) {
+    if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+      if (n.name) return n.name.text;
+      return ts.isVariableDeclaration(n.parent) && ts.isIdentifier(n.parent.name) ? n.parent.name.text : "";
+    }
+    if (ts.isObjectLiteralExpression(n) && ts.isMethodDeclaration(node)) return "";
+    if (ts.isMethodDeclaration(n) && ts.isObjectLiteralExpression(n.parent)) return "";
+    // A plain function has its own `this`.
+    if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) return null;
+  }
+  return null;
+}
+
+/** `{ Query: { user: (parent, args) => … } }` — a GraphQL resolver map. */
+function isGraphqlResolver(fn: ts.Node): boolean {
+  const member = ts.isMethodDeclaration(fn) ? fn : fn.parent && ts.isPropertyAssignment(fn.parent) ? fn.parent : null;
+  const map = member?.parent;
+  const owner = map && ts.isObjectLiteralExpression(map) ? map.parent : null;
+  return !!owner && ts.isPropertyAssignment(owner) && /^(?:Query|Mutation|Subscription)$/.test(propertyKey(owner.name) ?? "");
+}
+
+/** True for `"/users/" + id` and `` `/users/${id}` ``: a fixed, single-slash path prefix. */
+function hasLocalPathPrefix(node: ts.Expression): boolean {
+  let e = node;
+  while (ts.isParenthesizedExpression(e)) e = e.expression;
+  let head: string | null = null;
+  if (ts.isTemplateExpression(e)) head = e.head.text;
+  else {
+    while (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.PlusToken) e = e.left;
+    if (ts.isStringLiteralLike(e) && e !== node) head = e.text;
+  }
+  return head !== null && /^\/[^/\\]/.test(head);
+}
+
+/** The `Location` entry of a headers object literal, optionally nested under `key` (`{ headers: { Location } }`). */
+function headerValue(node: ts.Expression, key?: string): ts.Expression | undefined {
+  if (!ts.isObjectLiteralExpression(node)) return undefined;
+  for (const p of node.properties) {
+    if (!ts.isPropertyAssignment(p)) continue;
+    const name = propertyKey(p.name) ?? "";
+    if (key ? name === key : /^location$/i.test(name)) return key ? headerValue(p.initializer) : p.initializer;
+  }
+  return undefined;
+}
+
+/** What a Zod schema lets through: nothing attacker-shaped ("clean"), free text ("raw"), or an object of those. */
+type Shape = "clean" | "raw" | Map<string, Shape>;
+
+const ZOD_CONSTRAINED = /^(?:z|zod)\.(?:coerce\.)?(?:number|boolean|bigint|date|int|int32|float32|float64|enum|nativeEnum|literal|uuid|guid|cuid2?|ulid|nanoid|ipv4|ipv6|iso)\b/;
+const ZOD_STRING_FORMAT = /^(?:z|zod)\.string\(\)[\s\S]*\.(?:uuid|guid|cuid2?|ulid|nanoid|datetime|date|time|ip|ipv4|ipv6)\(/;
+
+function zodShape(expr: ts.Expression): Shape | null {
+  // Walk back through .optional() / .strict() / .default(…) to the constructor call.
+  let e = expr;
+  for (;;) {
+    if (!ts.isCallExpression(e)) return null;
+    const text = e.expression.getText().replace(/\s+/g, "");
+    if (/^(?:z|zod)\.(?:object|strictObject|looseObject)$/.test(text)) {
+      const arg = e.arguments[0];
+      if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
+      const fields = new Map<string, Shape>();
+      for (const p of arg.properties) {
+        const key = p.name ? propertyKey(p.name) : null;
+        if (key === null || !ts.isPropertyAssignment(p)) return null;
+        fields.set(key, zodShape(p.initializer) ?? "raw");
+      }
+      return fields;
+    }
+    if (/^(?:z|zod)\.array$/.test(text)) return e.arguments[0] ? zodShape(e.arguments[0]) : null;
+    if (/^(?:z|zod)\./.test(text)) {
+      const whole = expr.getText().replace(/\s+/g, "");
+      if (ZOD_CONSTRAINED.test(whole) || ZOD_STRING_FORMAT.test(whole)) return "clean";
+      const pattern = /\.regex\((\/(?:[^/\\\n]|\\.)+\/[a-z]*)/.exec(expr.getText());
+      return pattern && isStrictPattern(pattern[1]) ? "clean" : "raw";
+    }
+    if (!ts.isPropertyAccessExpression(e.expression)) return null;
+    e = e.expression.expression;
+  }
+}
+
+/** The schema an expression refers to: a declared `const Query = z.object(…)` or an inline one. */
+function schemaShape(expr: ts.Expression, declared: Map<string, Shape>): Shape | null {
+  if (ts.isIdentifier(expr)) return declared.get(expr.text) ?? null;
+  return zodShape(expr);
+}
+
+function applyShape(shape: Shape, input: Taint | null): Taint | null {
+  if (!input || shape === "clean") return null;
+  if (shape === "raw") return input;
+  const fields = new Map<string, Taint | null>();
+  for (const [key, sub] of shape) fields.set(key, applyShape(sub, input));
+  return [...fields.values()].some(Boolean) ? { ...input, fields } : null;
+}
+
+interface FileFacts {
+  /** Classes declared in this file. */
+  classes: Set<string>;
+  /** Variable or parameter name → the class it is declared as (`new C()` or `: C`). */
+  instances: Map<string, string>;
+  /** `Class#field` → the class that field is declared as. */
+  fields: Map<string, string>;
+  /** Local name → the function it really is (`promisify(exec)`, `import { exec as run }`). */
+  renamed: Map<string, string>;
+  schemas: Map<string, Shape>;
+}
+
+/** One pass over the declarations. Flow-insensitive on purpose: it only decides which summary a call resolves to. */
+function collectFacts(sf: ts.SourceFile): FileFacts {
+  const facts: FileFacts = { classes: new Set(), instances: new Map(), fields: new Map(), renamed: new Map(), schemas: new Map() };
+  const typeName = (t: ts.TypeNode | undefined) => (t && ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) ? t.typeName.text : null);
+  const constructed = (e: ts.Expression | undefined) => (e && ts.isNewExpression(e) && ts.isIdentifier(e.expression) ? e.expression.text : null);
+  const external = (spec: ts.Expression) => ts.isStringLiteral(spec) && !/^[./]/.test(spec.text);
+
+  const visit = (node: ts.Node) => {
+    if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name) facts.classes.add(node.name.text);
+    else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      const init = node.initializer;
+      const cls = constructed(init) ?? typeName(node.type);
+      if (cls) facts.instances.set(node.name.text, cls);
+      if (init && ts.isClassExpression(init)) facts.classes.add(node.name.text);
+      if (init && ts.isCallExpression(init) && /^(?:util\.)?promisify$/.test(init.expression.getText(sf)) && init.arguments[0]) {
+        facts.renamed.set(node.name.text, init.arguments[0].getText(sf).replace(/\s+/g, ""));
+      }
+      const shape = init ? zodShape(init) : null;
+      if (shape) facts.schemas.set(node.name.text, shape);
+    } else if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer && ts.isCallExpression(node.initializer) && node.initializer.expression.getText(sf) === "require" && node.initializer.arguments[0] && external(node.initializer.arguments[0])) {
+      // const { exec: run } = require("child_process")
+      for (const el of node.name.elements) if (el.propertyName && ts.isIdentifier(el.propertyName) && ts.isIdentifier(el.name)) facts.renamed.set(el.name.text, el.propertyName.text);
+    } else if (ts.isImportDeclaration(node) && external(node.moduleSpecifier) && node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+      for (const el of node.importClause.namedBindings.elements) if (el.propertyName) facts.renamed.set(el.name.text, el.propertyName.text);
+    } else if (ts.isParameter(node) && ts.isIdentifier(node.name)) {
+      const cls = typeName(node.type);
+      if (cls) {
+        facts.instances.set(node.name.text, cls);
+        // constructor(private readonly users: UserService) declares the field this.users.
+        if (ts.isConstructorDeclaration(node.parent) && ts.getModifiers(node)?.length) facts.fields.set(`${classContext(node.parent) ?? ""}#${node.name.text}`, cls);
+      }
+    } else if (ts.isPropertyDeclaration(node) && ts.isIdentifier(node.name)) {
+      const cls = constructed(node.initializer) ?? typeName(node.type);
+      if (cls) facts.fields.set(`${classContext(node) ?? ""}#${node.name.text}`, cls);
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left) && node.left.expression.kind === ts.SyntaxKind.ThisKeyword) {
+      // this.repo = new Repo()  /  this.repo = repo (a parameter declared as Repo)
+      const cls = constructed(node.right) ?? (ts.isIdentifier(node.right) ? facts.instances.get(node.right.text) : null);
+      if (cls) facts.fields.set(`${classContext(node) ?? ""}#${node.left.name.text}`, cls);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return facts;
 }
 
 /** Calls that never return: the code after them only runs when they weren't reached. */
@@ -1502,7 +1750,7 @@ export function exportedFunctionNames(sf: ts.SourceFile): Map<string, string> {
   const out = new Map<string, string>();
   const hasMod = (n: ts.Node, kind: ts.SyntaxKind) => ts.canHaveModifiers(n) && !!ts.getModifiers(n)?.some((m) => m.kind === kind);
   for (const stmt of sf.statements) {
-    if (ts.isFunctionDeclaration(stmt) && stmt.name && hasMod(stmt, ts.SyntaxKind.ExportKeyword)) {
+    if ((ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt)) && stmt.name && hasMod(stmt, ts.SyntaxKind.ExportKeyword)) {
       out.set(hasMod(stmt, ts.SyntaxKind.DefaultKeyword) ? "default" : stmt.name.text, stmt.name.text);
       if (hasMod(stmt, ts.SyntaxKind.DefaultKeyword)) out.set(stmt.name.text, stmt.name.text);
     } else if (ts.isVariableStatement(stmt) && hasMod(stmt, ts.SyntaxKind.ExportKeyword)) {

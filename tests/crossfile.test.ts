@@ -63,6 +63,22 @@ describe("cross-file taint", () => {
     expect(shell.score).toBeLessThan(60);
   });
 
+  it("follows calls on instances of an imported class, including through a barrel", () => {
+    const project = [
+      { path: "src/services/users.ts", code: `import { db } from "../db";\nexport class UserService {\n  findByName(name: string) {\n    return db.query("SELECT * FROM users WHERE name = '" + name + "'");\n  }\n  findById(id: string) {\n    return db.query("SELECT * FROM users WHERE id = $1", [id]);\n  }\n}\n` },
+      { path: "src/services/index.ts", code: `export { UserService } from "./users";\n` },
+      { path: "src/routes.ts", code: `import { UserService } from "./services";\nconst users = new UserService();\napp.get("/a", async (req, res) => res.json(await users.findByName(req.query.name)));\napp.get("/b", async (req, res) => res.json(await users.findById(req.query.id)));\n` },
+      { path: "src/controller.ts", code: `import { UserService } from "./services/users";\nexport class UsersController {\n  constructor(private readonly users: UserService) {}\n  show(req, res) {\n    return this.users.findByName(req.params.name);\n  }\n}\n` },
+    ];
+    const service = scanProject(project).find((r) => r.path === "src/services/users.ts")!;
+    const sql = service.findings.filter((f) => f.ruleId === "AEG-TAINT-SQL");
+    expect(sql).toHaveLength(1);
+    expect(sql[0].location.line).toBe(4);
+    expect(sql[0].trace!.some((s) => s.label.includes("passed to UserService.findByName() in src/services/users.ts"))).toBe(true);
+    // Without the callers there is no untrusted input, so nothing to report.
+    expect(scanProject(project.slice(0, 2)).flatMap((r) => r.findings).filter((f) => f.detector === "taint")).toEqual([]);
+  });
+
   it("leaves single files untouched", () => {
     expect(scanProject([files[0]])[0].findings.filter((f) => f.detector === "taint")).toHaveLength(0);
   });

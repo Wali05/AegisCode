@@ -213,3 +213,70 @@ describe("lexical engine (Python / PHP)", () => {
     expect(ids(`<?php echo htmlspecialchars($_GET['name']) ?>`, "a.php")).toEqual([]);
   });
 });
+
+describe("calls into the project's own classes", () => {
+  it("follows a typed field into another class's method", () => {
+    const code = `class ProductService {\n  constructor(private db) {}\n  search(term: string) {\n    return this.db.query("SELECT * FROM p WHERE name LIKE '%" + term + "%'");\n  }\n}\nclass ProductController {\n  constructor(private service: ProductService) {}\n  async list(req, res) {\n    res.json(await this.service.search(req.query.q));\n  }\n}`;
+    const [f] = taint("a.ts", code);
+    expect(f.ruleId).toBe("AEG-TAINT-SQL");
+    expect(f.location.line).toBe(4);
+    expect(f.trace!.some((s) => s.label.includes("passed to ProductService.search()"))).toBe(true);
+  });
+
+  it("keeps same-named methods of different classes apart", () => {
+    const code = `class Safe {\n  run(x) { return x.length; }\n}\nclass Unsafe {\n  run(x) { return exec("ls " + x); }\n}\nconst a = new Safe();\nconst b = new Unsafe();\napp.get("/a", (req, res) => res.json(a.run(req.query.d)));`;
+    expect(ids(code)).toEqual([]);
+    expect(ids(code.replace("a.run(req.query.d)", "b.run(req.query.d)"))).toEqual(["AEG-TAINT-CMD"]);
+  });
+
+  it("still treats a driver call as a sink when the receiver's class is unknown", () => {
+    expect(ids(`class Repo {\n  query(sql) { return this.pool.query(sql); }\n}\napp.get("/", (req, res) => db.query("SELECT " + req.query.c));`)).toEqual(["AEG-TAINT-SQL"]);
+  });
+});
+
+describe("second-pass sources, sinks and validators", () => {
+  it("sees through promisify and renamed imports", () => {
+    expect(ids(`import { exec } from "node:child_process";\nimport { promisify } from "node:util";\nconst execAsync = promisify(exec);\napp.post("/t", async (req, res) => { await execAsync(\`convert \${req.body.file} out.png\`); });`)).toEqual(["AEG-TAINT-CMD"]);
+    expect(ids(`import { exec as sh } from "node:child_process";\napp.post("/t", (req, res) => { sh("ls " + req.body.dir); });`)).toEqual(["AEG-TAINT-CMD"]);
+    expect(ids(`import { execFile } from "node:child_process";\nconst run = promisify(execFile);\napp.post("/t", async (req, res) => { await run("ls", [req.body.dir]); });`)).toEqual([]);
+  });
+
+  it("treats GraphQL resolver arguments as client input", () => {
+    const resolvers = (body: string) => `export const resolvers = {\n  Query: {\n    user: async (_parent, args, ctx) => {\n      ${body}\n    },\n  },\n};`;
+    expect(ids(resolvers(`return ctx.db.query("SELECT * FROM users WHERE email = '" + args.email + "'");`))).toEqual(["AEG-TAINT-SQL"]);
+    expect(ids(resolvers(`return ctx.db.query("SELECT * FROM users WHERE email = $1", [args.email]);`))).toEqual([]);
+    // The same shape outside a resolver map is just a function.
+    expect(ids(`export const helpers = {\n  Format: {\n    user: (_p, args, ctx) => ctx.db.query("SELECT " + args.col),\n  },\n};`)).toEqual([]);
+  });
+
+  it("reports SQL built inside a query-builder condition, not bound values", () => {
+    expect(ids(handler("res.json(await repo.createQueryBuilder(\"u\").where(`u.name = '${req.query.name}'`).getMany());"))).toEqual(["AEG-TAINT-SQL"]);
+    expect(ids(handler(`res.json(await repo.createQueryBuilder("u").where("u.name = :name", { name: req.query.name }).getMany());`))).toEqual([]);
+    expect(ids(handler(`res.json(await knex("users").where("name", req.query.name));`))).toEqual([]);
+    expect(ids(handler(`res.json(await knex("users").where({ name: String(req.query.name) }));`))).toEqual([]);
+  });
+
+  it("reports a tainted Location header however it is set", () => {
+    expect(ids(handler(`res.writeHead(302, { Location: req.query.to });\nres.end();`))).toEqual(["AEG-TAINT-REDIRECT"]);
+    expect(ids(handler(`res.setHeader("Location", req.query.to);\nres.statusCode = 302;\nres.end();`))).toEqual(["AEG-TAINT-REDIRECT"]);
+    expect(ids(`export async function GET(request) {\n  const to = new URL(request.url).searchParams.get("to");\n  return new Response(null, { status: 302, headers: { Location: to } });\n}`)).toEqual(["AEG-TAINT-REDIRECT"]);
+    expect(ids(handler(`res.setHeader("Content-Type", req.query.type);\nres.end();`))).toEqual([]);
+  });
+
+  it("does not call a fixed same-site path prefix an open redirect", () => {
+    expect(ids(handler(`res.redirect("/users/" + req.params.id);`))).toEqual([]);
+    expect(ids(handler("res.redirect(`/users/${req.params.id}`);"))).toEqual([]);
+    // A bare "/" prefix still lets "//evil.example" through.
+    expect(ids(handler(`res.redirect("/" + req.query.next);`))).toEqual(["AEG-TAINT-REDIRECT"]);
+    expect(ids(handler(`res.redirect("//" + req.query.host + "/x");`))).toEqual(["AEG-TAINT-REDIRECT"]);
+  });
+
+  it("reads Zod schemas: constrained fields come out clean, free text does not", () => {
+    const zod = (shape: string, use: string) => `import { z } from "zod";\nconst Query = z.object(${shape});\napp.get("/posts", async (req, res) => {\n  ${use}\n});`;
+    expect(ids(zod(`{ dir: z.enum(["asc", "desc"]) }`, `const { dir } = Query.parse(req.query);\nres.json(await db.query("SELECT * FROM posts ORDER BY created_at " + dir));`))).toEqual([]);
+    expect(ids(zod(`{ page: z.coerce.number().int().min(1), id: z.string().uuid() }`, `const q = Query.parse(req.query);\nres.json(await db.query(\`SELECT * FROM posts WHERE id = '\${q.id}' OFFSET \${q.page}\`));`))).toEqual([]);
+    expect(ids(zod(`{ title: z.string().min(1).max(80) }`, `const { title } = Query.parse(req.query);\nres.json(await db.query("SELECT * FROM posts WHERE title = '" + title + "'"));`))).toEqual(["AEG-TAINT-SQL"]);
+    expect(ids(zod(`{ slug: z.string().regex(/^[a-z0-9-]+$/), note: z.string() }`, `const parsed = Query.safeParse(req.query);\nif (!parsed.success) return res.status(400).end();\nres.json(await db.query("SELECT * FROM posts WHERE slug = '" + parsed.data.slug + "'"));`))).toEqual([]);
+    expect(ids(zod(`{ slug: z.string().regex(/^[a-z0-9-]+$/), note: z.string() }`, `const parsed = Query.safeParse(req.query);\nif (!parsed.success) return res.status(400).end();\nres.json(await db.query("SELECT * FROM posts WHERE note = '" + parsed.data.note + "'"));`))).toEqual(["AEG-TAINT-SQL"]);
+  });
+});
