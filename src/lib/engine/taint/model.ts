@@ -19,8 +19,8 @@ export const SOURCE_MEMBERS: Array<{ pattern: RegExp; label: string }> = [
 
 /** Call expressions whose *result* is attacker-controlled. Matched against the callee text. */
 export const SOURCE_CALLS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /^(?:req|request)\.(?:json|text|formData|arrayBuffer|blob)$/, label: "HTTP request body" },
-  { pattern: /^(?:req|request|c\.req)\.(?:get|header|param|query|cookie)$/, label: "HTTP request input" },
+  { pattern: /^(?:req|request|c\.req|ctx\.req)\.(?:json|text|formData|arrayBuffer|blob|parseBody)$/, label: "HTTP request body" },
+  { pattern: /^(?:req|request|c\.req|ctx\.req)\.(?:get|header|param|query|queries|cookie|valid)$/, label: "HTTP request input" },
   { pattern: /searchParams\.get(?:All)?$|^(?:useSearchParams|useParams)$/, label: "URL query parameter" },
   { pattern: /^(?:headers|cookies)\(\)\.get$/, label: "request header / cookie" },
   { pattern: /^(?:window\.)?prompt$/, label: "user prompt" },
@@ -32,16 +32,53 @@ export const REQUEST_BINDINGS = new Set(["query", "body", "params", "headers", "
 export const HTTP_HANDLER_NAMES = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|handler|loader|action)$/;
 export const ROUTER_CALL = /\.(?:get|post|put|patch|delete|all|use|route|on)$/;
 
-/** Calls whose return value is considered clean regardless of input. */
-export const SANITIZER_CALLS: RegExp[] = [
-  /^(?:parseInt|parseFloat|Number|Boolean|BigInt|isNaN|isFinite|Array\.isArray)$/,
-  /^Math\./,
-  /^(?:encodeURIComponent|encodeURI|escape)$/,
-  /^(?:DOMPurify|purify|dompurify)\.sanitize$/,
-  /^(?:path\.)?basename$/,
-  /(?:^|\.)(?:sanitize\w*|escape\w*|encode\w*|validate\w*|is[A-Z]\w*|filterXSS|xss|toNumber|toInt|uuidValidate|hash\w*|createHash|digest|compare\w*)$/i,
-  /(?:^|\.)(?:includes|startsWith|endsWith|test|has|indexOf|lastIndexOf|localeCompare|every|some|findIndex)$/,
+/** Parameter types that mark a handler argument as the incoming request, whatever it is named. */
+export const REQUEST_TYPES = /^(?:Next(?:Api)?Request|Request|express\.Request|FastifyRequest|(?:http\.)?IncomingMessage|HonoRequest)\b/;
+/** Next.js route handlers: the first parameter is the request. */
+export const VERB_HANDLER_NAMES = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/;
+/** NestJS-style parameter decorators that inject request data. */
+export const PARAM_DECORATORS = /^(?:Query|Param|Body|Headers|Cookies|UploadedFiles?|RawBody|HostParam|Args|MessageBody|Payload)$/;
+export const REQUEST_DECORATORS = /^(?:Req|Request)$/;
+/** Pipes that convert a decorated parameter to a non-string primitive before the handler sees it. */
+export const VALIDATING_PIPES = /Parse(?:Int|Float|Bool|UUID|Enum|Date)Pipe/;
+
+/**
+ * What a sanitiser neutralises. Escaping is only safe for the context it was
+ * written for: HTML-escaping a value does nothing for a SQL query, and
+ * `path.basename` does nothing for a shell command. `"all"` is reserved for
+ * conversions that leave no attacker-controlled text behind (numbers, booleans,
+ * hashes) and for helpers whose purpose can't be told from the name.
+ */
+const HTML_SINKS = ["AEG-TAINT-XSS"] as const;
+const SANITIZERS: Array<{ pattern: RegExp; neutralises: "all" | readonly string[] }> = [
+  { pattern: /^(?:parseInt|parseFloat|Number|Boolean|BigInt|isNaN|isFinite|Array\.isArray)$/, neutralises: "all" },
+  { pattern: /^Math\./, neutralises: "all" },
+  { pattern: /(?:^|\.)(?:includes|startsWith|endsWith|test|has|indexOf|lastIndexOf|localeCompare|every|some|findIndex)$/, neutralises: "all" },
+  // HTML escapers and sanitisers
+  { pattern: /^(?:DOMPurify|purify|dompurify)\.sanitize$/, neutralises: HTML_SINKS },
+  { pattern: /(?:^|\.)(?:escapeHtml|htmlEscape|sanitizeHtml|encodeHtml|htmlEncode|encodeEntities|escapeMarkup|filterXSS|xss|stripTags|striptags)$/i, neutralises: HTML_SINKS },
+  { pattern: /^(?:_|lodash|validator|he|entities)\.(?:escape|encode)$/, neutralises: HTML_SINKS },
+  // URL encoding: percent-encodes markup, separators and shell metacharacters, but leaves quotes and parentheses alone.
+  { pattern: /^encodeURIComponent$/, neutralises: ["AEG-TAINT-XSS", "AEG-TAINT-PATH", "AEG-TAINT-SSRF", "AEG-TAINT-REDIRECT", "AEG-TAINT-CMD", "AEG-TAINT-SSTI"] },
+  { pattern: /^encodeURI$/, neutralises: HTML_SINKS },
+  { pattern: /^(?:path\.)?basename$/, neutralises: ["AEG-TAINT-PATH"] },
+  // Context-specific escapers
+  { pattern: /(?:^|\.)(?:escapeLiteral|escapeIdentifier|escapeId|escapeSql|sqlEscape)$/i, neutralises: ["AEG-TAINT-SQL"] },
+  { pattern: /^(?:mysql2?|connection|conn|pool|db|client|sqlstring|SqlString|pg)\.escape$/, neutralises: ["AEG-TAINT-SQL"] },
+  { pattern: /(?:^|\.)(?:shellEscape|shellescape|shellQuote|escapeShell\w*)$/i, neutralises: ["AEG-TAINT-CMD"] },
+  { pattern: /(?:^|\.)(?:escapeRegExp|escapeRegex|escapeStringRegexp|regexEscape)$|^RegExp\.escape$/i, neutralises: ["AEG-TAINT-REDOS"] },
+  // Results that carry no attacker-controlled text, and helpers whose context the name doesn't reveal.
+  { pattern: /(?:^|\.)(?:toNumber|toInt|uuidValidate|hash\w*|createHash|digest|compare\w*)$/i, neutralises: "all" },
+  { pattern: /(?:^|\.)(?:is[A-Z]\w*|sanitize\w*|escape\w*|encode\w*|validate\w*)$/, neutralises: "all" },
 ];
+
+export function sanitizerScope(callee: string): "all" | readonly string[] | null {
+  for (const s of SANITIZERS) if (s.pattern.test(callee)) return s.neutralises;
+  return null;
+}
+
+/** Decoders undo any escaping applied earlier in the flow. */
+export const DECODERS = /^(?:decodeURIComponent|decodeURI|unescape|atob|JSON\.parse)$|(?:^|\.)(?:decode\w*|unescape\w*)$/;
 
 /** Tagged templates that parameterise interpolations (safe SQL builders). */
 export const SAFE_TAGS = /^(?:sql|SQL|Prisma\.sql|Prisma\.raw|css|gql|graphql|html)$/;

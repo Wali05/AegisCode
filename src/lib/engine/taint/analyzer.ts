@@ -5,16 +5,22 @@ import {
   ARG_PASSTHROUGH,
   ARRAY_CALLBACK_METHODS,
   ASSIGNMENT_SINKS,
+  DECODERS,
   HTTP_HANDLER_NAMES,
+  PARAM_DECORATORS,
   PASSTHROUGH_METHODS,
   REQUEST_BINDINGS,
+  REQUEST_DECORATORS,
+  REQUEST_TYPES,
   RESPONSE_WRITERS,
   ROUTER_CALL,
   SAFE_TAGS,
-  SANITIZER_CALLS,
   SINKS,
   SOURCE_CALLS,
   SOURCE_MEMBERS,
+  VALIDATING_PIPES,
+  VERB_HANDLER_NAMES,
+  sanitizerScope,
   type SinkSpec,
 } from "./model";
 
@@ -22,7 +28,12 @@ import {
  * Intra-file taint analysis for JavaScript / TypeScript on the TypeScript
  * compiler AST.
  *
- *  - Flow-sensitive within straight-line code, scope-aware (block, function, closure).
+ *  - Flow-sensitive and scope-aware (block, function, closure). Branches of `if`,
+ *    `switch`, `try` and loops are analysed separately and joined afterwards, so a
+ *    value that is tainted on any path into a sink is reported, and one that is
+ *    validated or replaced on every path is not.
+ *  - Sanitisers are context-aware: an HTML escaper clears a value for HTML sinks
+ *    only, and object literals are tracked per field.
  *  - Interprocedural through *function summaries*: every local function is first
  *    analysed with symbolic taint on its parameters, recording which parameters
  *    reach a sink and which flow to the return value. Call sites then apply the
@@ -43,6 +54,10 @@ interface Taint {
   structured: boolean;
   /** The value has been concatenated into an HTML fragment (drives reflected-XSS checks across helpers). */
   markup?: boolean;
+  /** Sink ids this value has been escaped for (`escapeHtml(x)` is safe in HTML, still dangerous in SQL). */
+  neutralised?: ReadonlySet<string>;
+  /** Per-property taint, when the value is an object literal whose keys are all known. */
+  fields?: ReadonlyMap<string, Taint | null>;
 }
 
 /** Where a sink call lives. Plain data, so summaries can cross file boundaries. */
@@ -98,30 +113,113 @@ interface Guard {
 const MAX_STEPS = 8;
 const HTML_TAG = /<\/?[a-z][\w-]*[\s>]/i;
 
+/** How a statement leaves the code that follows it: not at all, out of a loop / switch, or out of the function. */
+type ExitKind = "none" | "break" | "continue" | "leave";
+
+interface Branch {
+  fork: Scope;
+  exit: ExitKind;
+}
+
 class Scope {
   private vars = new Map<string, Taint | null>();
   private clean = new Set<string>();
-  constructor(readonly parent?: Scope) {}
+  private aliases = new Set<string>();
+  /**
+   * Present on scopes that open a conditional branch. Writes to variables that
+   * live outside the branch are buffered here instead of being applied, then
+   * merged with the other branches once they have all been analysed.
+   */
+  private overlay: Map<string, Taint | null> | null;
+  /** Overlay entries that come from an assignment rather than from a guard. */
+  private written = new Set<string>();
+
+  constructor(
+    readonly parent?: Scope,
+    branch = false,
+    /** Function (or module) scopes are where `var` declarations live. */
+    readonly isFunction = false
+  ) {
+    this.overlay = branch ? new Map() : null;
+  }
+
   /** Marks an expression (by normalised text) as validated within this scope. */
   markClean(text: string) {
     this.clean.add(text);
   }
+  /** `e.data` being validated also covers `e.data.html` and `e.data[0]`. */
   isClean(text: string): boolean {
-    return this.clean.has(text) || !!this.parent?.isClean(text);
+    for (const c of this.clean) if (text === c || text.startsWith(`${c}.`) || text.startsWith(`${c}[`)) return true;
+    return !!this.parent?.isClean(text);
+  }
+  cleanTexts(): string[] {
+    return [...this.clean];
   }
   declare(name: string, taint: Taint | null) {
     this.vars.set(name, taint);
   }
+  /** `var` is function-scoped: make sure the name exists there, then assign through the normal path. */
+  hoist(name: string) {
+    if (!this.isFunction && this.parent) this.parent.hoist(name);
+    else if (!this.vars.has(name)) this.vars.set(name, null);
+  }
+  /** A guard proved `name` safe on this branch. */
+  refine(name: string) {
+    if (this.overlay && !this.vars.has(name)) {
+      this.overlay.set(name, null);
+      this.written.delete(name);
+    } else this.vars.set(name, null);
+  }
+  /** The parameter `name` is the incoming request (so `name.query` is a source even if it isn't called `req`). */
+  alias(name: string) {
+    this.aliases.add(name);
+  }
+  isAlias(name: string): boolean {
+    if (this.aliases.has(name)) return true;
+    if (this.vars.has(name)) return false;
+    return !!this.parent?.isAlias(name);
+  }
   has(name: string): boolean {
-    return this.vars.has(name) || !!this.parent?.has(name);
+    return this.vars.has(name) || !!this.overlay?.has(name) || !!this.parent?.has(name);
   }
   assign(name: string, taint: Taint | null) {
-    if (this.vars.has(name) || !this.parent?.has(name)) this.vars.set(name, taint);
-    else this.parent.assign(name, taint);
+    if (this.vars.has(name)) this.vars.set(name, taint);
+    else if (this.overlay && (this.overlay.has(name) || this.parent?.has(name))) {
+      this.overlay.set(name, taint);
+      this.written.add(name);
+    } else if (this.parent?.has(name)) this.parent.assign(name, taint);
+    else this.vars.set(name, taint);
   }
   lookup(name: string): Taint | null {
     if (this.vars.has(name)) return this.vars.get(name) ?? null;
+    if (this.overlay?.has(name)) return this.overlay.get(name) ?? null;
     return this.parent?.lookup(name) ?? null;
+  }
+  /** Outer variables this branch assigned or refined. */
+  touched(): string[] {
+    return this.overlay ? [...this.overlay.keys()] : [];
+  }
+  touches(name: string): boolean {
+    return !!this.overlay?.has(name);
+  }
+  wrote(name: string): boolean {
+    return this.written.has(name);
+  }
+  branchValue(name: string): Taint | null {
+    return this.overlay?.get(name) ?? null;
+  }
+  /**
+   * Starts this branch from where `from` ended, for paths that may or may not
+   * have run it first (a `case` reached by fall-through, a `catch` after a
+   * partly executed `try`).
+   */
+  inherit(from: Scope, merge: (a: Taint | null, b: Taint | null) => Taint | null) {
+    if (!this.overlay) return;
+    for (const name of from.touched()) {
+      if (!from.wrote(name)) continue;
+      this.overlay.set(name, merge(this.parent?.lookup(name) ?? null, from.branchValue(name)));
+      this.written.add(name);
+    }
   }
 }
 
@@ -147,17 +245,27 @@ export class TaintAnalyzer {
   private reported = new Set<string>();
   /** Taint stored on `this.<field>` while visiting the current class (field-sensitive, flow-insensitive). */
   private thisFields = new Map<string, Taint>();
+  /** One entry per function being visited: the taint of everything it returns. */
+  private frames: Array<{ returned: Taint | null }> = [];
+  /** Depth of `frames` at which returns belong to the function being summarised. */
+  private summaryFrame = -1;
+  private loopDepth = 0;
+  private summaryKeys = new Set<string>();
+  /** The module starts with a "use server" directive, so its exports are callable by any client. */
+  private useServerFile: boolean;
 
   constructor(
     private sf: ts.SourceFile,
     private file: string,
     private imports: ImportMap = new Map()
-  ) {}
+  ) {
+    this.useServerFile = hasDirective(sf.statements, "use server");
+  }
 
   run(): Finding[] {
     this.buildSummaries();
     this.mode = "report";
-    const root = new Scope();
+    const root = new Scope(undefined, false, true);
     for (const stmt of this.sf.statements) this.visit(stmt, root);
     return this.findings;
   }
@@ -232,8 +340,65 @@ export class TaintAnalyzer {
     if (!a) return b;
     if (!b) return a;
     // Prefer real sources over symbolic parameters, then the more confident flow.
-    if (a.origin.kind !== b.origin.kind) return a.origin.kind === "source" ? a : b;
-    return a.confidence >= b.confidence ? a : b;
+    const pick = a.origin.kind !== b.origin.kind ? (a.origin.kind === "source" ? a : b) : a.confidence >= b.confidence ? a : b;
+    const other = pick === a ? b : a;
+    // The combined value is only safe where both halves are, and only field-precise if they are the same object.
+    const neutralised = intersect(pick.neutralised, other.neutralised);
+    const fields = pick.fields === other.fields ? pick.fields : undefined;
+    const structured = pick.structured || other.structured;
+    const markup = pick.markup || other.markup;
+    if (neutralised === pick.neutralised && fields === pick.fields && structured === pick.structured && markup === pick.markup) return pick;
+    return { ...pick, neutralised, fields, structured, markup };
+  }
+
+  /**
+   * Merges the state at the end of each branch back into `scope`. A variable is
+   * tainted afterwards if it is tainted at the end of any branch that reaches
+   * the following code; branches that return or throw contribute nothing.
+   * Branches that `break` / `continue` contribute what they assigned, because
+   * that value is still live after the loop. `includeEntry` adds the path on
+   * which no branch ran at all (a loop body that never executes).
+   */
+  private join(scope: Scope, branches: Branch[], includeEntry = false) {
+    const live = branches.filter((b) => b.exit === "none");
+    const escaping = branches.filter((b) => b.exit === "break" || b.exit === "continue");
+    const names = new Set<string>();
+    for (const b of live) for (const n of b.fork.touched()) names.add(n);
+    for (const b of escaping) for (const n of b.fork.touched()) if (b.fork.wrote(n)) names.add(n);
+
+    const updates: Array<[string, Taint | null]> = [];
+    for (const n of names) {
+      const entry = scope.lookup(n);
+      let t: Taint | null = includeEntry || !live.length ? entry : null;
+      for (const b of live) t = this.union(t, b.fork.touches(n) ? b.fork.branchValue(n) : entry);
+      for (const b of escaping) if (b.fork.wrote(n)) t = this.union(t, b.fork.branchValue(n));
+      updates.push([n, t]);
+    }
+    for (const [n, t] of updates) if (t !== scope.lookup(n)) scope.assign(n, t);
+
+    // An expression validated on every path that reaches here stays validated.
+    if (live.length && !includeEntry) {
+      const [first, ...rest] = live;
+      for (const text of first.fork.cleanTexts()) if (rest.every((b) => b.fork.cleanTexts().includes(text))) scope.markClean(text);
+    }
+  }
+
+  /**
+   * Analyses a loop body. It runs twice so that a value assigned late in the
+   * body is seen by the code above it on the next iteration; the state after
+   * the loop is the join of "never ran" and "ran".
+   */
+  private loop(scope: Scope, body: ts.Statement, bind?: (inner: Scope) => void, after?: (inner: Scope) => void) {
+    const passes = this.loopDepth >= 3 ? 1 : 2;
+    this.loopDepth++;
+    for (let pass = 0; pass < passes; pass++) {
+      const fork = new Scope(scope, true);
+      bind?.(fork);
+      this.visit(body, fork);
+      after?.(fork);
+      this.join(scope, [{ fork, exit: "none" }], true);
+    }
+    this.loopDepth--;
   }
 
   private collectFunctions(): Map<string, FunctionLike> {
@@ -257,7 +422,7 @@ export class TaintAnalyzer {
 
   private summarise(name: string, fn: FunctionLike) {
     const summary: FunctionSummary = { name, returns: new Set(), returnsMarkup: new Set(), sinks: [] };
-    const scope = new Scope();
+    const scope = new Scope(undefined, false, true);
     fn.parameters.forEach((p, index) => {
       const taint: Taint = {
         origin: { kind: "param", index },
@@ -268,16 +433,28 @@ export class TaintAnalyzer {
       this.bindPattern(p.name, taint, scope);
     });
     const prev = this.currentSummary;
+    const prevFrame = this.summaryFrame;
     this.currentSummary = summary;
+    this.summaryKeys = new Set();
+    this.frames.push({ returned: null });
+    this.summaryFrame = this.frames.length;
     this.visitFunctionBody(fn, scope);
+    this.frames.pop();
+    this.summaryFrame = prevFrame;
     this.currentSummary = prev;
     this.summaries.set(name, summary);
   }
 
   // ─── sources & sinks ──────────────────────────────────────────────────────
 
-  private sourceFromMember(node: ts.Expression): Taint | null {
-    const text = this.calleeText(node);
+  /** Rewrites a request alias (`r.json`, `request.query` under another name) to the canonical `req.…`. */
+  private canonical(text: string, scope: Scope): string {
+    const m = /^[A-Za-z_$][\w$]*/.exec(text);
+    return m && !/^(?:req|request)$/.test(m[0]) && scope.isAlias(m[0]) ? `req${text.slice(m[0].length)}` : text;
+  }
+
+  private sourceFromMember(node: ts.Expression, scope: Scope): Taint | null {
+    const text = this.canonical(this.calleeText(node), scope);
     for (const src of SOURCE_MEMBERS) {
       if (src.pattern.test(text)) {
         const whole = /\.(?:body|query|params)\b/.test(text);
@@ -287,7 +464,8 @@ export class TaintAnalyzer {
     return null;
   }
 
-  private sourceFromCall(callee: string, node: ts.CallExpression): Taint | null {
+  private sourceFromCall(rawCallee: string, node: ts.CallExpression, scope: Scope): Taint | null {
+    const callee = this.canonical(rawCallee, scope);
     for (const src of SOURCE_CALLS) {
       if (src.pattern.test(callee)) {
         const whole = /\.(?:json|formData)$/.test(callee);
@@ -295,10 +473,6 @@ export class TaintAnalyzer {
       }
     }
     return null;
-  }
-
-  private isSanitizer(callee: string): boolean {
-    return SANITIZER_CALLS.some((re) => re.test(callee));
   }
 
   private siteOf(node: ts.Node): SinkSite {
@@ -313,7 +487,7 @@ export class TaintAnalyzer {
 
   private emit(hit: SinkHit, site: SinkSite) {
     if (this.mode === "summary") {
-      this.currentSummary?.sinks.push({ ...hit, site });
+      this.pushSummarySink({ ...hit, site });
       return;
     }
     const crossFile = site.file !== this.file;
@@ -343,11 +517,20 @@ export class TaintAnalyzer {
     );
   }
 
-  private checkSink(sink: SinkSpec, taint: Taint | null, argNode: ts.Expression, at: ts.Node | SinkSite) {
+  /** Records a parameter-to-sink flow on the function being summarised (loops visit their body twice). */
+  private pushSummarySink(hit: SinkHit) {
+    const key = `${hit.sink.id}:${hit.sink.title}:${hit.paramIndex}:${hit.site?.file}:${hit.site?.location.line}:${hit.site?.location.column}`;
+    if (this.summaryKeys.has(key)) return;
+    this.summaryKeys.add(key);
+    this.currentSummary?.sinks.push(hit);
+  }
+
+  private checkSink(sink: SinkSpec, taint: Taint | null, argNode: ts.Expression, at: ts.Node | SinkSite, why?: string) {
     if (!taint) return;
+    if (taint.neutralised?.has(sink.id)) return;
     if (sink.id === "AEG-TAINT-NOSQL" && !taint.structured) return;
     let severityOverride: SinkSpec["severity"] | undefined;
-    let note: string | undefined;
+    let note: string | undefined = why;
     let factor = 1;
 
     // An outbound URL whose scheme + host are fixed only lets the attacker steer the path.
@@ -423,15 +606,39 @@ export class TaintAnalyzer {
     }
     if (ts.isForOfStatement(node) || ts.isForInStatement(node)) {
       const iter = this.evalExpr(node.expression, scope);
-      const inner = new Scope(scope);
       const init = node.initializer;
-      const element = iter ? this.extend(iter, this.step("propagation", init, "loop variable")) : null;
-      if (ts.isVariableDeclarationList(init)) {
-        for (const d of init.declarations) this.bindPattern(d.name, element, inner);
-      } else {
-        this.assignTo(init, element, inner);
-      }
-      this.visit(node.statement, inner);
+      const element = iter ? this.extend({ ...iter, fields: undefined }, this.step("propagation", init, "loop variable")) : null;
+      this.loop(scope, node.statement, (inner) => {
+        if (ts.isVariableDeclarationList(init)) {
+          for (const d of init.declarations) this.bindPattern(d.name, element, inner);
+        } else {
+          this.assignTo(init, element, inner);
+        }
+      });
+      return;
+    }
+    if (ts.isForStatement(node)) {
+      const outer = new Scope(scope);
+      const init = node.initializer;
+      if (init && ts.isVariableDeclarationList(init)) for (const d of init.declarations) this.visitDeclaration(d, outer);
+      else if (init) this.evalExpr(init, outer);
+      if (node.condition) this.evalExpr(node.condition, outer);
+      this.loop(outer, node.statement, undefined, (inner) => {
+        if (node.incrementor) this.evalExpr(node.incrementor, inner);
+      });
+      return;
+    }
+    if (ts.isWhileStatement(node) || ts.isDoStatement(node)) {
+      this.evalExpr(node.expression, scope);
+      this.loop(scope, node.statement);
+      return;
+    }
+    if (ts.isSwitchStatement(node)) {
+      this.visitSwitch(node, scope);
+      return;
+    }
+    if (ts.isTryStatement(node)) {
+      this.visitTry(node, scope);
       return;
     }
     if (ts.isExpressionStatement(node)) {
@@ -457,22 +664,77 @@ export class TaintAnalyzer {
     this.evalExpr(node.expression, scope);
     const guard = this.guardOf(node.expression, scope);
 
-    this.visit(node.thenStatement, this.guardedScope(scope, guard, true));
-    if (node.elseStatement) this.visit(node.elseStatement, this.guardedScope(scope, guard, false));
+    const thenFork = this.guardedScope(scope, guard, true);
+    this.visit(node.thenStatement, thenFork);
+    // Without an `else`, the other path is "the condition was false": nothing runs, but the guard still holds.
+    const elseFork = this.guardedScope(scope, guard, false);
+    if (node.elseStatement) this.visit(node.elseStatement, elseFork);
 
-    if (!guard) return;
-    const exitBranch = guard.whenTrue ? node.elseStatement : node.thenStatement;
-    if (exitBranch && exits(exitBranch)) {
-      for (const n of guard.names) if (scope.has(n)) scope.assign(n, null);
-      for (const t of guard.texts) scope.markClean(t);
-    }
+    this.join(scope, [
+      { fork: thenFork, exit: exitKind(node.thenStatement) },
+      { fork: elseFork, exit: exitKind(node.elseStatement) },
+    ]);
   }
 
-  /** A child scope in which the guard's subjects are clean, for the branch where `cond === branch`. */
+  /**
+   * Each `case` is a branch. A clause that ends without `break` falls through,
+   * so the next clause starts from its state; without a `default`, the path
+   * where nothing matched is joined in as well.
+   */
+  private visitSwitch(node: ts.SwitchStatement, scope: Scope) {
+    this.evalExpr(node.expression, scope);
+    const branches: Branch[] = [];
+    let hasDefault = false;
+    let fallthrough: Scope | null = null;
+    const clauses = node.caseBlock.clauses;
+    clauses.forEach((clause, i) => {
+      if (ts.isDefaultClause(clause)) hasDefault = true;
+      else this.evalExpr(clause.expression, scope);
+      const fork = new Scope(scope, true);
+      if (fallthrough) fork.inherit(fallthrough, (a, b) => this.union(a, b));
+      // `case "name":` pins the switched value to a constant, exactly like `x === "name"`.
+      if (ts.isCaseClause(clause) && (ts.isStringLiteralLike(clause.expression) || ts.isNumericLiteral(clause.expression))) {
+        const pinned = this.subjectsOf(node.expression, scope);
+        for (const n of pinned.names) fork.refine(n);
+        for (const t of pinned.texts) fork.markClean(t);
+      }
+      for (const stmt of clause.statements) this.visit(stmt, fork);
+      let exit: ExitKind = "none";
+      for (const stmt of clause.statements) if ((exit = exitKind(stmt)) !== "none") break;
+      const last = i === clauses.length - 1;
+      fallthrough = exit === "none" && !last ? fork : null;
+      // `break` leaves the switch, so that state carries on to the code after it.
+      if (exit === "break" || (exit === "none" && last)) branches.push({ fork, exit: "none" });
+      else if (exit !== "none") branches.push({ fork, exit });
+    });
+    this.join(scope, branches, !hasDefault);
+  }
+
+  /**
+   * The `try` block may stop at any statement, so `catch` starts from a state in
+   * which each of its assignments may or may not have happened. Whatever is
+   * true after both is true for `finally` and the code that follows.
+   */
+  private visitTry(node: ts.TryStatement, scope: Scope) {
+    const tryFork = new Scope(scope, true);
+    this.visit(node.tryBlock, tryFork);
+    const branches: Branch[] = [{ fork: tryFork, exit: exitKind(node.tryBlock) }];
+    if (node.catchClause) {
+      const catchFork = new Scope(scope, true);
+      catchFork.inherit(tryFork, (a, b) => this.union(a, b));
+      if (node.catchClause.variableDeclaration) this.bindPattern(node.catchClause.variableDeclaration.name, null, catchFork);
+      this.visit(node.catchClause.block, catchFork);
+      branches.push({ fork: catchFork, exit: exitKind(node.catchClause.block) });
+    }
+    this.join(scope, branches);
+    if (node.finallyBlock) this.visit(node.finallyBlock, scope);
+  }
+
+  /** A branch scope in which the guard's subjects are clean, for the branch where `cond === branch`. */
   private guardedScope(scope: Scope, guard: Guard | null, branch: boolean): Scope {
-    const inner = new Scope(scope);
+    const inner = new Scope(scope, true);
     if (guard && guard.whenTrue === branch) {
-      for (const n of guard.names) inner.declare(n, null);
+      for (const n of guard.names) inner.refine(n);
       for (const t of guard.texts) inner.markClean(t);
     }
     return inner;
@@ -487,9 +749,13 @@ export class TaintAnalyzer {
       else break;
     }
     if (ts.isIdentifier(e)) return { names: [e.text], texts: [] };
+    // Checking a message's origin is what makes its payload trustworthy: `if (e.origin !== APP) return;`.
+    if (ts.isPropertyAccessExpression(e) && e.name.text === "origin" && ts.isIdentifier(e.expression)) {
+      return { names: [], texts: [`${e.expression.text}.data`, this.calleeText(e)] };
+    }
     // A validated request field (req.query.next) clears that field only, never the whole request object.
     const base = baseName(e);
-    if (base && scope.has(base) && !this.sourceFromMember(e)) return { names: [base], texts: [] };
+    if (base && scope.has(base) && !this.sourceFromMember(e, scope)) return { names: [base], texts: [] };
     return { names: [], texts: [this.calleeText(e)] };
   }
 
@@ -559,7 +825,7 @@ export class TaintAnalyzer {
       if ((method === "has" || method === "includes") && call.arguments.length === 1) return argNames();
       // /^[a-z0-9]+$/.test(x) — only anchored patterns constrain the whole value
       if (method === "test" && call.arguments.length === 1) {
-        if (ts.isRegularExpressionLiteral(receiver) && !/^\/\^[\s\S]*\$\/[a-z]*$/.test(receiver.text)) return [];
+        if (ts.isRegularExpressionLiteral(receiver) && !isStrictPattern(receiver.text)) return [];
         return argNames();
       }
       // resolved.startsWith(root) — but a bare protocol check ("https://") proves nothing about the host
@@ -581,7 +847,15 @@ export class TaintAnalyzer {
     }
     const value = this.evalExpr(decl.initializer, scope);
     const label = ts.isIdentifier(decl.name) ? `assigned to \`${decl.name.text}\`` : "destructured";
-    this.bindPattern(decl.name, value ? this.extend(value, this.step("propagation", decl, label)) : null, scope);
+    const taint = value ? this.extend(value, this.step("propagation", decl, label)) : null;
+    // `var` belongs to the function, not the block: declare it there and assign, so branches join correctly.
+    const isVar = ts.isVariableDeclarationList(decl.parent) && !(decl.parent.flags & ts.NodeFlags.BlockScoped);
+    if (isVar && ts.isIdentifier(decl.name) && !scope.isFunction) {
+      scope.hoist(decl.name.text);
+      scope.assign(decl.name.text, taint);
+      return;
+    }
+    this.bindPattern(decl.name, taint, scope);
   }
 
   private bindPattern(name: ts.BindingName, taint: Taint | null, scope: Scope) {
@@ -591,20 +865,28 @@ export class TaintAnalyzer {
     }
     for (const el of name.elements) {
       if (ts.isOmittedExpression(el)) continue;
-      this.bindPattern(el.name, taint, scope);
+      // `const { host } = cfg` reads one known field of an object literal.
+      const key = ts.isObjectBindingPattern(name) && !el.dotDotDotToken ? propertyKey(el.propertyName ?? el.name) : null;
+      const known = taint?.fields && key !== null && taint.fields.has(key);
+      this.bindPattern(el.name, known ? (taint!.fields!.get(key!) ?? null) : taint && taint.fields ? { ...taint, fields: undefined } : taint, scope);
     }
   }
 
-  private visitFunction(fn: FunctionLike | ts.ConstructorDeclaration | ts.AccessorDeclaration, outer: Scope, seed?: Taint | null) {
-    const scope = new Scope(outer);
+  /** Visits a function body in report or summary mode and returns the taint of what it returns. */
+  private visitFunction(fn: FunctionLike | ts.ConstructorDeclaration | ts.AccessorDeclaration, outer: Scope, seed?: Taint | null, seedIndex = 0): Taint | null {
+    const scope = new Scope(outer, false, true);
     const name = (fn as ts.FunctionDeclaration).name;
-    const isHandler = (name && ts.isIdentifier(name) && HTTP_HANDLER_NAMES.test(name.text)) || this.isRouterCallback(fn);
+    const declared = name && ts.isIdentifier(name) ? name.text : ts.isVariableDeclaration(fn.parent) && ts.isIdentifier(fn.parent.name) ? fn.parent.name.text : "";
+    const isHandler = HTTP_HANDLER_NAMES.test(declared) || this.isRouterCallback(fn);
+    const serverAction = this.isServerAction(fn);
 
     fn.parameters.forEach((p, i) => {
-      if (i === 0 && seed) {
+      if (i === seedIndex && seed) {
         this.bindPattern(p.name, this.extend(seed, this.step("propagation", p, "callback parameter")), scope);
         return;
       }
+      const type = p.type ? this.text(p.type) : "";
+      const primitive = /^(?:number|boolean|bigint|Date)\b/.test(type);
       if (isHandler && ts.isObjectBindingPattern(p.name)) {
         for (const el of p.name.elements) {
           const key = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : ts.isIdentifier(el.name) ? el.name.text : "";
@@ -617,9 +899,50 @@ export class TaintAnalyzer {
         }
         return;
       }
+      // NestJS: @Query("sort") sort: string — the decorator injects request data.
+      const decorator = this.paramDecorator(p);
+      if (decorator?.kind === "data" && !primitive) {
+        const t: Taint = { origin: { kind: "source" }, steps: [this.step("source", p, `@${decorator.name}() request input`)], confidence: 0.9, structured: decorator.name === "Body" || type !== "string" };
+        this.bindPattern(p.name, t, scope);
+        return;
+      }
+      // Server Actions are public endpoints: their arguments come straight from the client.
+      if (serverAction && !primitive) {
+        const t: Taint = { origin: { kind: "source" }, steps: [this.step("source", p, "Server Action argument")], confidence: 0.85, structured: !/^(?:string|FormData)\b/.test(type) };
+        this.bindPattern(p.name, t, scope);
+        return;
+      }
       this.bindPattern(p.name, null, scope);
+      // A request under another name: `POST(r: Request)`, `@Req() incoming`, `(msg: IncomingMessage)`.
+      if (ts.isIdentifier(p.name) && (REQUEST_TYPES.test(type) || decorator?.kind === "request" || (i === 0 && VERB_HANDLER_NAMES.test(declared)))) scope.alias(p.name.text);
     });
+
+    this.frames.push({ returned: null });
     this.visitFunctionBody(fn, scope);
+    return this.frames.pop()!.returned;
+  }
+
+  private paramDecorator(p: ts.ParameterDeclaration): { kind: "data" | "request"; name: string } | null {
+    for (const d of (ts.canHaveDecorators(p) && ts.getDecorators(p)) || []) {
+      const call = ts.isCallExpression(d.expression) ? d.expression : null;
+      const name = this.text(call ? call.expression : d.expression);
+      if (REQUEST_DECORATORS.test(name)) return { kind: "request", name };
+      if (!PARAM_DECORATORS.test(name)) continue;
+      // @Param("id", ParseIntPipe) hands the method a number, not the raw string.
+      if (call?.arguments.some((a) => VALIDATING_PIPES.test(this.text(a)))) return null;
+      return { kind: "data", name };
+    }
+    return null;
+  }
+
+  /** `"use server"` at the top of the module (for its exports) or of the function body. */
+  private isServerAction(fn: ts.Node & { body?: ts.Node }): boolean {
+    if (fn.body && ts.isBlock(fn.body) && hasDirective(fn.body.statements, "use server")) return true;
+    if (!this.useServerFile) return false;
+    const exported = (n: ts.Node) => ts.canHaveModifiers(n) && !!ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    if (ts.isFunctionDeclaration(fn)) return exported(fn);
+    const decl = fn.parent;
+    return (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && !!decl && ts.isVariableDeclaration(decl) && !!decl.parent?.parent && ts.isVariableStatement(decl.parent.parent) && exported(decl.parent.parent);
   }
 
   private isRouterCallback(fn: ts.Node): boolean {
@@ -638,7 +961,10 @@ export class TaintAnalyzer {
   }
 
   private recordReturn(t: Taint | null) {
-    if (!t || t.origin.kind !== "param" || !this.currentSummary) return;
+    const frame = this.frames[this.frames.length - 1];
+    if (frame) frame.returned = this.union(frame.returned, t);
+    // A `return` inside a nested callback is that callback's result, not the summarised function's.
+    if (!t || t.origin.kind !== "param" || !this.currentSummary || this.frames.length !== this.summaryFrame) return;
     this.currentSummary.returns.add(t.origin.index);
     if (t.markup) this.currentSummary.returnsMarkup.add(t.origin.index);
   }
@@ -684,10 +1010,18 @@ export class TaintAnalyzer {
         return;
       }
       // Writing a tainted value into an object taints the object itself.
-      if (value) {
-        let base: ts.Expression = target.expression;
-        while (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) base = base.expression;
-        if (ts.isIdentifier(base)) scope.assign(base.text, this.union(scope.lookup(base.text), value));
+      let base: ts.Expression = target.expression;
+      while (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) base = base.expression;
+      if (!ts.isIdentifier(base)) return;
+      const current = scope.lookup(base.text);
+      const key = target.expression === base ? accessKey(target) : null;
+      if (current?.fields && key !== null) {
+        // The object's fields are known, so only the written one changes.
+        const fields = new Map(current.fields).set(key, value);
+        scope.assign(base.text, { ...(value ? this.union({ ...current, fields: undefined }, value)! : current), fields });
+      } else if (value) {
+        const merged = this.union(current, value)!;
+        scope.assign(base.text, merged.fields ? { ...merged, fields: undefined } : merged);
       }
     }
   }
@@ -704,7 +1038,7 @@ export class TaintAnalyzer {
     if (ts.isSpreadElement(node)) return this.evalExpr(node.expression, scope);
 
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      const src = this.sourceFromMember(node);
+      const src = this.sourceFromMember(node, scope);
       if (src) return src;
       if (ts.isPropertyAccessExpression(node) && node.expression.kind === ts.SyntaxKind.ThisKeyword) {
         const field = this.thisFields.get(node.name.text);
@@ -714,7 +1048,10 @@ export class TaintAnalyzer {
       const obj = this.evalExpr(node.expression, scope);
       if (!obj) return null;
       if (ts.isPropertyAccessExpression(node) && node.name.text === "length") return null;
-      return obj;
+      // A known field of an object literal carries its own taint; anything else inherits the object's.
+      const key = accessKey(node);
+      if (obj.fields && key !== null && obj.fields.has(key)) return obj.fields.get(key) ?? null;
+      return obj.fields ? { ...obj, fields: undefined } : obj;
     }
 
     if (ts.isCallExpression(node)) return this.evalCall(node, scope);
@@ -740,18 +1077,30 @@ export class TaintAnalyzer {
       this.evalExpr(node.condition, scope);
       // isSafe(x) ? x : fallback — each branch is evaluated knowing which way the check went.
       const guard = this.guardOf(node.condition, scope);
-      return this.union(this.evalExpr(node.whenTrue, this.guardedScope(scope, guard, true)), this.evalExpr(node.whenFalse, this.guardedScope(scope, guard, false)));
+      const whenTrue = this.guardedScope(scope, guard, true);
+      const whenFalse = this.guardedScope(scope, guard, false);
+      const t = this.union(this.evalExpr(node.whenTrue, whenTrue), this.evalExpr(node.whenFalse, whenFalse));
+      this.join(scope, [{ fork: whenTrue, exit: "none" }, { fork: whenFalse, exit: "none" }]);
+      return t;
     }
 
     if (ts.isObjectLiteralExpression(node)) {
       let t: Taint | null = null;
+      // Field-precise as long as every key is a plain name; a spread or computed key makes the shape unknown.
+      let precise = true;
+      const fields = new Map<string, Taint | null>();
       for (const p of node.properties) {
-        if (ts.isPropertyAssignment(p)) t = this.union(t, this.evalExpr(p.initializer, scope));
-        else if (ts.isShorthandPropertyAssignment(p)) t = this.union(t, scope.lookup(p.name.text));
-        else if (ts.isSpreadAssignment(p)) t = this.union(t, this.evalExpr(p.expression, scope));
+        const key = p.name ? propertyKey(p.name) : null;
+        let value: Taint | null = null;
+        if (ts.isPropertyAssignment(p)) value = this.evalExpr(p.initializer, scope);
+        else if (ts.isShorthandPropertyAssignment(p)) value = scope.lookup(p.name.text);
+        else if (ts.isSpreadAssignment(p)) value = this.evalExpr(p.expression, scope);
         else if (ts.isMethodDeclaration(p) && this.mode === "report") this.visitFunction(p, scope);
+        if (key === null) precise = false;
+        else fields.set(key, value);
+        t = this.union(t, value);
       }
-      return t;
+      return t && precise ? { ...t, fields } : t && t.fields ? { ...t, fields: undefined } : t;
     }
 
     if (ts.isArrayLiteralExpression(node)) {
@@ -795,7 +1144,13 @@ export class TaintAnalyzer {
       return value;
     }
     const left = this.evalExpr(node.left, scope);
-    const right = this.evalExpr(node.right, scope);
+    // `isSafe(x) && run(x)`: the right-hand side only runs when the check passed (or, for `||`, failed).
+    let right: Taint | null;
+    if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken) {
+      const fork = this.guardedScope(scope, this.guardOf(node.left, scope), op === ts.SyntaxKind.AmpersandAmpersandToken);
+      right = this.evalExpr(node.right, fork);
+      this.join(scope, [{ fork, exit: "none" }], true);
+    } else right = this.evalExpr(node.right, scope);
     switch (op) {
       case ts.SyntaxKind.PlusToken: {
         const t = this.union(left, right);
@@ -844,10 +1199,12 @@ export class TaintAnalyzer {
       receiver = this.evalExpr(node.expression.expression, scope);
     }
 
-    // Callbacks on tainted collections receive tainted elements.
+    // Callbacks on tainted collections receive tainted elements (the accumulator comes first in reduce).
+    let callbackResult: Taint | null | undefined;
     const argTaints = args.map((a, i) => {
       if ((ts.isArrowFunction(a) || ts.isFunctionExpression(a)) && i === 0 && receiver && ARRAY_CALLBACK_METHODS.has(method)) {
-        this.visitFunction(a, scope, receiver);
+        const element = receiver.fields ? { ...receiver, fields: undefined } : receiver;
+        callbackResult = this.visitFunction(a, scope, element, method === "reduce" || method === "reduceRight" ? 1 : 0);
         return null;
       }
       return this.evalExpr(a, scope);
@@ -857,6 +1214,9 @@ export class TaintAnalyzer {
     const local = this.summaries.get(callee) ?? (ts.isIdentifier(node.expression) ? this.summaries.get(node.expression.text) : undefined);
     const external = local ? undefined : this.externalSummary(node.expression);
     const summary = local ?? external;
+
+    if (!summary) this.checkShellSpawn(callee, node, scope);
+    if (!summary) this.checkWhere(callee, node, scope);
 
     // Sinks — skipped for calls into the project's own code (a helper named `execute` is not a DB driver).
     for (const sink of summary ? [] : SINKS) {
@@ -879,7 +1239,7 @@ export class TaintAnalyzer {
         };
         const argNode = args[hit.paramIndex];
         if (actual.origin.kind === "param") {
-          if (this.mode === "summary") this.currentSummary?.sinks.push({ ...hit, paramIndex: actual.origin.index, steps: joined.steps, confidence: joined.confidence });
+          if (this.mode === "summary" && !actual.neutralised?.has(hit.sink.id)) this.pushSummarySink({ ...hit, paramIndex: actual.origin.index, steps: joined.steps, confidence: joined.confidence });
         } else {
           this.checkSink(hit.sink, joined, argNode, hit.site ?? node);
         }
@@ -891,13 +1251,25 @@ export class TaintAnalyzer {
       return ret ? this.extend({ ...ret, markup: ret.markup || markup }, this.step("propagation", node, `returned from ${summary.name}()${where}`)) : null;
     }
 
-    const source = this.sourceFromCall(callee, node);
+    const source = this.sourceFromCall(callee, node, scope);
     if (source) return source;
-    if (this.isSanitizer(callee)) return null;
 
-    // arr.map(Number) / arr.map(encodeURIComponent): every element passes through a sanitiser.
-    if (receiver && (method === "map" || method === "flatMap") && args[0] && !ts.isArrowFunction(args[0]) && !ts.isFunctionExpression(args[0]) && this.isSanitizer(this.calleeText(args[0]))) {
-      return null;
+    const everything = argTaints.reduce<Taint | null>((acc, t) => this.union(acc, t), receiver);
+    const cleans = sanitizerScope(callee);
+    if (cleans === "all") return null;
+    if (cleans) return this.neutralise(everything, cleans, node, callee);
+
+    if (receiver && (method === "map" || method === "flatMap") && args[0]) {
+      // arr.map((x) => Number(x)): the result is whatever the callback returns, not the original elements.
+      if (callbackResult !== undefined) return callbackResult ? this.extend({ ...callbackResult, fields: undefined }, this.step("propagation", node, `through .${method}()`)) : null;
+      // arr.map(Number) / arr.map(escapeHtml): every element passes through a sanitiser.
+      const each = ts.isArrowFunction(args[0]) || ts.isFunctionExpression(args[0]) ? null : sanitizerScope(this.calleeText(args[0]));
+      if (each === "all") return null;
+      if (each) return this.neutralise(receiver, each, node, this.calleeText(args[0]));
+    }
+    if (receiver && (method === "reduce" || method === "reduceRight") && callbackResult !== undefined) {
+      const result = this.union(callbackResult, argTaints[1] ?? null);
+      return result ? this.extend({ ...result, fields: undefined }, this.step("propagation", node, `through .${method}()`)) : null;
     }
 
     if (receiver) {
@@ -907,9 +1279,65 @@ export class TaintAnalyzer {
 
     const argTaint = argTaints.reduce<Taint | null>((acc, t) => this.union(acc, t), null);
     if (!argTaint) return null;
-    if (ARG_PASSTHROUGH.test(callee)) return this.extend({ ...argTaint, structured: false }, this.step("propagation", node, `through ${callee}()`));
+    // Decoding undoes whatever escaping happened earlier in the flow.
+    if (DECODERS.test(callee)) return this.extend({ ...argTaint, structured: false, neutralised: undefined, fields: undefined }, this.step("propagation", node, `through ${callee}()`));
+    if (ARG_PASSTHROUGH.test(callee)) return this.extend({ ...argTaint, structured: false, fields: undefined }, this.step("propagation", node, `through ${callee}()`));
     // Unknown function: assume the value flows through, with reduced confidence.
-    return this.extend({ ...argTaint, structured: false }, this.step("propagation", node, `through ${callee}()`), 0.75);
+    return this.extend({ ...argTaint, structured: false, fields: undefined }, this.step("propagation", node, `through ${callee}()`), 0.75);
+  }
+
+  /** The value survives a context-specific escaper: safe for those sinks, unchanged for the rest. */
+  private neutralise(t: Taint | null, sinks: readonly string[], node: ts.Node, callee: string): Taint | null {
+    if (!t) return null;
+    const neutralised = new Set([...(t.neutralised ?? []), ...sinks]);
+    return this.extend({ ...t, structured: false, fields: undefined, neutralised }, this.step("propagation", node, `escaped by ${callee}() for ${sinks.map((id) => SINK_CONTEXT[id] ?? id).join(" / ")} only`));
+  }
+
+  /**
+   * `spawn("sh", ["-c", cmd])` and `spawn(bin, args, { shell: true })` hand the
+   * argument array to a shell, so a tainted element is command injection even
+   * though the usual argument-array form is safe.
+   */
+  private checkShellSpawn(callee: string, node: ts.CallExpression, scope: Scope) {
+    if (!/(?:^|\.)(?:spawn|spawnSync|execFile|execFileSync|execa|execaSync)$/.test(callee)) return;
+    const [bin, list, opts] = node.arguments;
+    if (!bin || !list || !ts.isArrayLiteralExpression(list)) return;
+    const shellBinary = ts.isStringLiteralLike(bin) && /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|zsh|dash|ksh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)$/i.test(bin.text);
+    const shellOption =
+      !!opts &&
+      ts.isObjectLiteralExpression(opts) &&
+      opts.properties.some((p) => ts.isPropertyAssignment(p) && propertyKey(p.name) === "shell" && p.initializer.kind !== ts.SyntaxKind.FalseKeyword);
+    if (!shellBinary && !shellOption) return;
+    const sink = SINKS.find((s) => s.id === "AEG-TAINT-CMD")!;
+    list.elements.forEach((el, i) => {
+      const prev = list.elements[i - 1];
+      const afterFlag = !!prev && ts.isStringLiteralLike(prev) && /^(?:-[a-z]*c|\/c|-command|-encodedcommand)$/i.test(prev.text);
+      if (shellBinary && !shellOption && !afterFlag) return;
+      this.checkSink(sink, this.evalExpr(el, scope), el, node, shellOption ? "the arguments are joined and parsed by a shell (shell: true)" : "the string after -c is run by a shell");
+    });
+  }
+
+  /** MongoDB's `$where` evaluates a JavaScript string on the server, so a concatenated value is code injection. */
+  private checkWhere(callee: string, node: ts.CallExpression, scope: Scope) {
+    const sink = SINKS.find((s) => s.id === "AEG-TAINT-NOSQL")!;
+    if (!sink.callee.test(callee)) return;
+    const first = node.arguments[0];
+    if (!first) return;
+    const exprs = /\.\$where$/.test(callee)
+      ? [first]
+      : ts.isObjectLiteralExpression(first)
+        ? first.properties.flatMap((p) => (ts.isPropertyAssignment(p) && propertyKey(p.name) === "$where" ? [p.initializer] : []))
+        : [];
+    for (const e of exprs) {
+      const t = this.evalExpr(e, scope);
+      if (!t) continue;
+      this.checkSink(
+        { ...sink, title: "NoSQL injection via $where", severity: "critical", confidence: 0.85, description: "Untrusted input is concatenated into a MongoDB $where expression, which the server evaluates as JavaScript." },
+        { ...t, structured: true },
+        e,
+        node
+      );
+    }
   }
 
   /** Resolves `fn(...)`, `ns.fn(...)` or `defaultImport(...)` against imported module summaries. */
@@ -962,12 +1390,111 @@ function baseName(expr: ts.Expression): string | null {
   return ts.isIdentifier(e) ? e.text : null;
 }
 
-/** True when a statement always leaves the enclosing block (return / throw / continue / break). */
-function exits(stmt: ts.Statement): boolean {
-  if (ts.isReturnStatement(stmt) || ts.isThrowStatement(stmt) || ts.isContinueStatement(stmt) || ts.isBreakStatement(stmt)) return true;
-  if (ts.isBlock(stmt)) return stmt.statements.some((s) => exits(s));
-  if (ts.isIfStatement(stmt)) return !!stmt.elseStatement && exits(stmt.thenStatement) && exits(stmt.elseStatement);
+/** Calls that never return: the code after them only runs when they weren't reached. */
+const NEVER_RETURNS = /^(?:process\.exit|notFound|redirect|permanentRedirect|assert\.fail)$/;
+
+/** How a statement leaves the code after it (see `ExitKind`). */
+function exitKind(stmt: ts.Statement | undefined): ExitKind {
+  if (!stmt) return "none";
+  if (ts.isReturnStatement(stmt) || ts.isThrowStatement(stmt)) return "leave";
+  if (ts.isBreakStatement(stmt)) return "break";
+  if (ts.isContinueStatement(stmt)) return "continue";
+  if (ts.isExpressionStatement(stmt) && ts.isCallExpression(stmt.expression) && NEVER_RETURNS.test(stmt.expression.expression.getText().replace(/\s+/g, ""))) return "leave";
+  if (ts.isBlock(stmt)) {
+    for (const s of stmt.statements) {
+      const kind = exitKind(s);
+      if (kind !== "none") return kind;
+    }
+    return "none";
+  }
+  if (ts.isIfStatement(stmt)) {
+    const a = exitKind(stmt.thenStatement);
+    const b = exitKind(stmt.elseStatement);
+    if (a === "none" || b === "none") return "none";
+    // Both branches leave; if either only leaves the loop, that is the weaker guarantee.
+    return a === "leave" ? b : a;
+  }
+  if (ts.isTryStatement(stmt)) {
+    const fin = exitKind(stmt.finallyBlock);
+    if (fin !== "none") return fin;
+    const body = exitKind(stmt.tryBlock);
+    const handler = stmt.catchClause ? exitKind(stmt.catchClause.block) : body;
+    if (body === "none" || handler === "none") return "none";
+    return body === "leave" ? handler : body;
+  }
+  return "none";
+}
+
+function hasDirective(statements: ts.NodeArray<ts.Statement>, directive: string): boolean {
+  for (const stmt of statements) {
+    if (!ts.isExpressionStatement(stmt) || !ts.isStringLiteral(stmt.expression)) return false;
+    if (stmt.expression.text === directive) return true;
+  }
   return false;
+}
+
+/** A property name that is known statically: `a`, `"a"`, `1`; null for computed keys. */
+function propertyKey(name: ts.Node): string | null {
+  if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name) || ts.isPrivateIdentifier(name)) return name.text;
+  return null;
+}
+
+/** The static key of `obj.key` / `obj["key"]`, or null for `obj[expr]`. */
+function accessKey(node: ts.Node): string | null {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node)) return propertyKey(node.argumentExpression);
+  return null;
+}
+
+function intersect(a: ReadonlySet<string> | undefined, b: ReadonlySet<string> | undefined): ReadonlySet<string> | undefined {
+  if (!a || !b) return undefined;
+  if (a === b) return a;
+  const out = new Set([...a].filter((x) => b.has(x)));
+  return out.size ? out : undefined;
+}
+
+const SINK_CONTEXT: Record<string, string> = {
+  "AEG-TAINT-XSS": "HTML",
+  "AEG-TAINT-SQL": "SQL",
+  "AEG-TAINT-CMD": "shell",
+  "AEG-TAINT-PATH": "file paths",
+  "AEG-TAINT-SSRF": "URLs",
+  "AEG-TAINT-REDIRECT": "redirects",
+  "AEG-TAINT-SSTI": "templates",
+  "AEG-TAINT-REDOS": "regular expressions",
+};
+
+/**
+ * A regex literal only validates a whole value when every top-level alternative
+ * is anchored at both ends (`/^\d+$/`, not `/^\d+|x/`) and it doesn't simply
+ * accept anything (`/^.*$/`).
+ */
+export function isStrictPattern(literal: string): boolean {
+  const body = literal.slice(1, literal.lastIndexOf("/"));
+  if (/(?<!\\)(?:\\\\)*\.[*+]|\[\\s\\S\][*+]|\[\\w\\W\][*+]|\[\\d\\D\][*+]|\[\^\][*+]/.test(body)) return false;
+  const alternatives: string[] = [];
+  let depth = 0;
+  let inClass = false;
+  let current = "";
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === "\\") {
+      current += ch + (body[++i] ?? "");
+      continue;
+    }
+    if (inClass) inClass = ch !== "]";
+    else if (ch === "[") inClass = true;
+    else if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (ch === "|" && depth === 0) {
+      alternatives.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  alternatives.push(current);
+  return alternatives.every((alt) => alt.startsWith("^") && /(?<!\\)(?:\\\\)*\$$/.test(alt));
 }
 
 /** Maps export names to the local function names that implement them (ESM and CommonJS). */

@@ -19,6 +19,8 @@ interface LexSink {
   when?: (args: string) => boolean;
   severity?: Severity;
   title?: string;
+  /** The argument text ends here even without a closing paren (`<?= $x ?>`). */
+  until?: string;
 }
 
 interface LexConfig {
@@ -73,7 +75,8 @@ const PHP: LexConfig = {
     { sink: "AEG-TAINT-SSRF", call: /\b(?:file_get_contents|curl_init|fsockopen|get_headers)\s*\(/, arg: 0 },
     { sink: "AEG-TAINT-REDIRECT", call: /\bheader\s*\(/, arg: 0, when: (a) => /Location\s*:/i.test(a) },
     { sink: "AEG-TAINT-DESER", call: /\bunserialize\s*\(/, arg: 0 },
-    { sink: "AEG-TAINT-XSS", call: /\b(?:echo|print)\b/, arg: "any" },
+    { sink: "AEG-TAINT-XSS", call: /\b(?:echo|print)\b/, arg: "any", until: "?>" },
+    { sink: "AEG-TAINT-XSS", call: /<\?=/, arg: "any", until: "?>" },
   ],
 };
 
@@ -166,12 +169,59 @@ function splitArgs(text: string, open: number): { args: string[]; full: string }
   return { args, full: text.slice(open, i) };
 }
 
+/**
+ * Joins physical lines into logical ones: a call whose argument list is spread
+ * over several lines is analysed as a single statement, reported at the line
+ * where it starts. Bracket depth is counted on the view with string contents
+ * blanked, so brackets inside strings don't count.
+ */
+function logicalLines(views: SourceViews, lang: Language): Array<{ text: string; line: number }> {
+  // In Python an open brace is a dict literal; in PHP it opens a block, which is not a continuation.
+  const openers = lang === "python" ? "([{" : "([";
+  const closers = lang === "python" ? ")]}" : ")]";
+  const text = views.noComments.split("\n");
+  const shape = views.codeOnly.split("\n");
+  const out: Array<{ text: string; line: number }> = [];
+  for (let i = 0; i < text.length; i++) {
+    let joined = text[i];
+    let depth = 0;
+    const start = i;
+    for (;;) {
+      for (const c of shape[i] ?? "") {
+        if (openers.includes(c)) depth++;
+        else if (closers.includes(c)) depth--;
+      }
+      if (depth <= 0 || i + 1 >= text.length || i - start >= 40) break;
+      joined += ` ${text[++i].trim()}`;
+    }
+    out.push({ text: joined, line: start + 1 });
+  }
+  return out;
+}
+
+const PY_ROUTE = /^\s*@[\w.]+\.(?:get|post|put|patch|delete|route|api_route|websocket)\s*\(/;
+const PY_DEF = /^(\s*)(?:async\s+)?def\s+\w+\s*\((.*)\)\s*(?:->[^:]+)?:\s*$/;
+/** Handler parameters the framework injects itself; they are not request data. */
+const PY_INFRA_TYPES = /^(?:Request|Response|Session|AsyncSession|BackgroundTasks|WebSocket|HTTPConnection|Connection|Engine|Redis|Settings|int|float|bool|UUID|uuid\.UUID|date|datetime|Decimal)\b/;
+
+/** Splits a Python parameter list into name / annotation / default. */
+function pythonParams(list: string): Array<{ name: string; type: string; dflt: string }> {
+  return splitArgs(list, 0).args.flatMap((raw) => {
+    const m = /^([A-Za-z_]\w*)\s*(?::\s*([^=]+?))?\s*(?:=\s*(.+))?$/.exec(raw.trim());
+    return m ? [{ name: m[1], type: (m[2] ?? "").trim(), dflt: (m[3] ?? "").trim() }] : [];
+  });
+}
+
 export function lexicalTaint(views: SourceViews, lang: Language, file: string): Finding[] {
   const cfg = lang === "python" ? PY : lang === "php" ? PHP : null;
   if (!cfg) return [];
 
-  const lines = views.noComments.split("\n");
+  const lines = logicalLines(views, lang);
   const tainted = new Map<string, TraceStep[]>();
+  /** Indentation at which each tainted Python variable was assigned, so locals die with their function. */
+  const indentOf = new Map<string, number>();
+  /** The route decorator waiting for its `def`, if any. */
+  let route: string | null = null;
   const findings: Finding[] = [];
   const seen = new Set<string>();
 
@@ -193,15 +243,44 @@ export function lexicalTaint(views: SourceViews, lang: Language, file: string): 
 
   const sourceLabel = (expr: string) => cfg.sources.find((s) => s.re.test(expr))?.label ?? "untrusted input";
 
-  lines.forEach((line, i) => {
-    const lineNo = i + 1;
-    if (!line.trim()) return;
+  for (const { text: line, line: lineNo } of lines) {
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+
+    // 0. Python function boundaries: locals of the previous function go out of scope,
+    //    parameters shadow outer names, and route handlers receive request data as arguments.
+    if (lang === "python") {
+      const def = PY_DEF.exec(line);
+      if (def) {
+        const depth = def[1].length;
+        for (const [name, at] of indentOf) {
+          if (at > depth) {
+            tainted.delete(name);
+            indentOf.delete(name);
+          }
+        }
+        const converted = new Set([...(route ?? "").matchAll(/<(?:int|float|uuid):(\w+)>/g)].map((m) => m[1]));
+        for (const p of pythonParams(def[2])) {
+          tainted.delete(p.name);
+          indentOf.delete(p.name);
+          if (route === null || /^(?:self|cls|request|req)$/.test(p.name) || converted.has(p.name)) continue;
+          if (PY_INFRA_TYPES.test(p.type) || /\b(?:Depends|Security)\s*\(/.test(p.dflt)) continue;
+          tainted.set(p.name, [{ kind: "source", line: lineNo, label: "route parameter", snippet: line.trim().slice(0, 90) }]);
+          indentOf.set(p.name, depth + 1);
+        }
+        route = null;
+        continue;
+      }
+      if (PY_ROUTE.test(line)) route = line;
+      else if (!/^\s*@/.test(line)) route = null;
+    }
 
     // 1. Sinks on this line.
     for (const ls of cfg.sinks) {
       const re = new RegExp(ls.call.source, "g");
       for (const m of line.matchAll(re)) {
-        const { args, full } = splitArgs(line, m.index! + m[0].length);
+        const stop = ls.until ? line.indexOf(ls.until, m.index!) : -1;
+        const { args, full } = splitArgs(stop === -1 ? line : line.slice(0, stop), m.index! + m[0].length);
         if (ls.when && !ls.when(full)) continue;
         const candidates = ls.arg === "any" ? args : args[ls.arg] !== undefined ? [args[ls.arg]] : [];
         for (const arg of candidates) {
@@ -219,7 +298,7 @@ export function lexicalTaint(views: SourceViews, lang: Language, file: string): 
               rule: spec,
               file,
               location: { line: lineNo, column: col, endLine: lineNo, endColumn: col + m[0].length + full.length },
-              snippet: line,
+              snippet: line.trim(),
               confidence: spec.confidence * (trace.length > 4 ? 0.8 : 0.9) * (ls.severity ? 0.8 : 1),
               detector: "taint",
               trace: steps,
@@ -256,8 +335,10 @@ export function lexicalTaint(views: SourceViews, lang: Language, file: string): 
         if (trace !== null) {
           const prior = trace.length ? trace : [{ kind: "source" as const, line: lineNo, label: sourceLabel(am[3]), snippet: am[3].trim().slice(0, 90) }];
           tainted.set(name, [...prior, { kind: "propagation" as const, line: lineNo, label: `assigned to \`${name}\``, snippet: line.trim().slice(0, 90) }].slice(-8));
+          if (!indentOf.has(name)) indentOf.set(name, indent);
         } else if (!append) {
           tainted.delete(name);
+          indentOf.delete(name);
         }
       }
     }
@@ -267,10 +348,13 @@ export function lexicalTaint(views: SourceViews, lang: Language, file: string): 
       const loop = /^\s*for\s+([A-Za-z_]\w*)\s+in\s+(.+):\s*$/.exec(line);
       if (loop) {
         const trace = taintOf(loop[2]);
-        if (trace !== null) tainted.set(loop[1], [...trace, { kind: "propagation", line: lineNo, label: `loop variable \`${loop[1]}\``, snippet: line.trim() }]);
+        if (trace !== null) {
+          tainted.set(loop[1], [...trace, { kind: "propagation", line: lineNo, label: `loop variable \`${loop[1]}\``, snippet: line.trim() }]);
+          if (!indentOf.has(loop[1])) indentOf.set(loop[1], indent + 1);
+        }
       }
     }
-  });
+  }
 
   return findings;
 }
