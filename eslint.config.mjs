@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated CLI bundle (scripts/build-cli.mjs).
+    "dist/**",
     // Deliberately vulnerable snippets used as benchmark input.
     "bench/cases/**",
   ]),
