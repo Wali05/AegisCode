@@ -46,13 +46,17 @@ export class RateLimiter {
     const b = this.buckets.get(key) ?? { tokens: this.capacity, updated: now };
     b.tokens = Math.min(this.capacity, b.tokens + (now - b.updated) * this.refillPerMs);
     b.updated = now;
-    if (this.buckets.size > 5000) this.buckets.clear(); // bound memory under abuse
+    // Bound memory under abuse by dropping the oldest clients. Clearing everything
+    // would hand every client a full bucket, which is exactly what a flood wants.
+    if (this.buckets.size > 5000) for (const stale of [...this.buckets.keys()].slice(0, 1000)) this.buckets.delete(stale);
     if (b.tokens >= 1) {
       b.tokens -= 1;
+      // Re-insert so the map stays ordered by last use.
+      this.buckets.delete(key);
       this.buckets.set(key, b);
       return { ok: true, retryAfterSec: 0 };
     }
     this.buckets.set(key, b);
-    return { ok: false, retryAfterSec: Math.ceil((1 - b.tokens) / this.refillPerMs / 1000) };
+    return { ok: false, retryAfterSec: this.refillPerMs > 0 ? Math.ceil((1 - b.tokens) / this.refillPerMs / 1000) : 600 };
   }
 }

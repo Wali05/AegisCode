@@ -108,7 +108,12 @@ export class GitHubClient {
     if ((res.status === 403 || res.status === 429) && res.headers.get("x-ratelimit-remaining") === "0") {
       const reset = Number(res.headers.get("x-ratelimit-reset")) * 1000;
       const mins = reset ? Math.max(1, Math.ceil((reset - Date.now()) / 60_000)) : 60;
-      return new GitHubError("GitHub API rate limit reached.", 429, `Resets in ~${mins} min. Set GITHUB_TOKEN to raise the limit to 5,000 requests/hour.`);
+      const why = this.tokenRejected
+        ? "GitHub rejected the configured GITHUB_TOKEN, so requests are anonymous (60 an hour). Replace the token to get 5,000."
+        : this.authenticated
+          ? "The configured token has used its hourly quota."
+          : "Set GITHUB_TOKEN to raise the limit to 5,000 requests/hour.";
+      return new GitHubError("GitHub API rate limit reached.", 429, `Resets in ~${mins} min. ${why}`);
     }
     return new GitHubError(`GitHub responded with ${res.status}.`, 502);
   }

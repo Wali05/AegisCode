@@ -11,18 +11,24 @@ const MAX_SNIPPET = 200_000;
 
 const Body = z
   .object({
-    url: z.string().trim().min(3).max(2048).optional(),
+    url: z.string().trim().min(3, "That doesn't look like a GitHub URL or owner/repo.").max(2048, "The URL is too long.").optional(),
     code: z.string().max(MAX_SNIPPET, `Snippets are limited to ${MAX_SNIPPET / 1000} KB.`).optional(),
     filename: z
       .string()
       .trim()
-      .max(200)
+      .max(200, "Filename is limited to 200 characters.")
       .regex(/^[\w./-]*$/, "Filename may only contain letters, digits, dot, dash, underscore and slash.")
       .optional(),
-    swarm: z.enum(["auto", "force", "off"]).default("auto"),
+    swarm: z.enum(["auto", "force", "off"], "`swarm` must be auto, force or off.").default("auto"),
   })
   .refine((b) => !!b.url !== (b.code !== undefined), { message: "Provide either `url` or `code`, not both." })
   .refine((b) => b.code === undefined || b.code.trim().length > 0, { message: "The snippet is empty." });
+
+/** MAX_REPO_FILES, kept to a sane range so a typo in the environment can't disable or explode repo scans. */
+function maxRepoFiles(): number {
+  const n = Number(process.env.MAX_REPO_FILES);
+  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 400) : 40;
+}
 
 function json(status: number, body: Record<string, unknown>, headers?: HeadersInit) {
   return Response.json(body, { status, headers });
@@ -81,7 +87,7 @@ export async function POST(request: Request) {
         } else {
           const report = await runAudit(
             { url: body.url, code: body.code, filename: body.filename, swarm: body.swarm },
-            { github: github(request.signal), provider: provider(), maxRepoFiles: Number(process.env.MAX_REPO_FILES ?? 40), signal: request.signal },
+            { github: github(request.signal), provider: provider(), maxRepoFiles: maxRepoFiles(), signal: request.signal },
             send
           );
           cache().set(key, report);

@@ -14,7 +14,9 @@ const globalState = globalThis as unknown as {
 
 function state() {
   if (!globalState.__aegis) {
-    const perWindow = Number(process.env.RATE_LIMIT_PER_10_MIN ?? 12);
+    // A malformed value would make every bucket NaN and lock everyone out, so fall back to the default.
+    const configured = Number(process.env.RATE_LIMIT_PER_10_MIN);
+    const perWindow = Number.isFinite(configured) && configured >= 1 ? configured : 12;
     globalState.__aegis = {
       cache: new LruCache<AuditReport>(200, 30 * 60_000),
       limiter: new RateLimiter(perWindow, perWindow / (10 * 60_000)),
